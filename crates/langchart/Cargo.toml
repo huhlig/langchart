@@ -1,0 +1,19 @@
+[package]
+name        = "langchart"
+description = "Agentic statechart engine for building governed, durable agentic workflows. Public re-export crate."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[features]
+default = []
+docuvault = ["dep:langchart-docuvault"]
+
+[dependencies]
+langchart-model    = { workspace = true }
+langchart-adapters = { workspace = true }
+langchart-runtime  = { workspace = true }
+langchart-context  = { workspace = true }
+langchart-docuvault = { workspace = true, optional = true }

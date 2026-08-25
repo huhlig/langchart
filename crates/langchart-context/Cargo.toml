@@ -1,0 +1,23 @@
+[package]
+name        = "langchart-context"
+description = "Composable ContextResolverChain: artifact, memory, workflow-data, truncation, and recording stages."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[dependencies]
+langchart-model    = { workspace = true }
+langchart-adapters = { workspace = true }
+async-trait        = { workspace = true }
+futures            = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+chrono             = { version = "0.4", features = ["serde"] }
+ulid               = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

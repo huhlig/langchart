@@ -1,0 +1,22 @@
+[package]
+name        = "langchart-artifact-fs"
+description = "File-system backed ArtifactStore for langchart. Each artifact is a directory of ULID-versioned files."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[dependencies]
+langchart-model    = { workspace = true }
+langchart-adapters = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+async-trait        = { workspace = true }
+tokio              = { workspace = true, features = ["fs", "io-util"] }
+ulid               = { workspace = true }
+fs2                = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

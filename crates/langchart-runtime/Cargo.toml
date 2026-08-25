@@ -1,0 +1,44 @@
+[package]
+name        = "langchart-runtime"
+description = "Async statechart execution engine: event loop, capability broker, checkpointing, timers, and cancellation."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[dependencies]
+langchart-model    = { workspace = true }
+langchart-adapters = { workspace = true }
+tokio              = { workspace = true }
+async-trait        = { workspace = true }
+futures            = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+ron                = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+ulid               = { workspace = true }
+time               = { workspace = true }
+chrono             = { version = "0.4", features = ["serde"] }
+cel-interpreter = { workspace = true, features = ["json"] }
+regex = "1"
+
+[dev-dependencies]
+tokio              = { workspace = true, features = ["full", "test-util"] }
+proptest           = { workspace = true }
+langchart-context  = { workspace = true }
+ron                = { workspace = true }
+criterion          = { workspace = true }
+
+[[bench]]
+name = "rtc_throughput"
+harness = false
+
+[[bench]]
+name = "broker_overhead"
+harness = false
+
+[[bench]]
+name = "parallel_entry"
+harness = false

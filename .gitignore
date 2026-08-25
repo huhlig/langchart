@@ -1,0 +1,15 @@
+# Beads / Dolt files
+.beads-credential-key
+.beads/proxieddb/
+.dolt/
+*.db
+
+# Build files
+/editor/node_modules
+/target
+Cargo.lock
+
+# Agentic Files
+/.agents
+/.claude
+/.codex

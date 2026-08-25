@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0.0",
+  "id": "hello-world",
+  "version": "0.1.0",
+  "name": "Hello World",
+  "description": "Minimal two-state workflow for CLI smoke testing.",
+  "inputs": [],
+  "outputs": [],
+  "data_schema": { "fields": {} },
+  "policy": {},
+  "agents": [],
+  "states": [
+    {
+      "id": "start",
+      "name": "Start",
+      "type": "atomic",
+      "on": {
+        "go": [{ "target": "end", "priority": 0 }]
+      }
+    },
+    {
+      "id": "end",
+      "name": "End",
+      "type": "final"
+    }
+  ],
+  "initial": "start"
+}

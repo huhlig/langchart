@@ -1,0 +1,86 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/langchart",
+    "crates/langchart-adapters",
+    "crates/langchart-artifact-fs",
+    "crates/langchart-checkpoint-redb",
+    "crates/langchart-cli",
+    "crates/langchart-context",
+    "crates/langchart-docuvault",
+    "crates/langchart-editor-tauri",
+    "crates/langchart-llm-genai",
+    "crates/langchart-llm-generic",
+    "crates/langchart-llm-watsonx",
+    "crates/langchart-mcp-client",
+    "crates/langchart-memory-redb",
+    "crates/langchart-model",
+    "crates/langchart-model-router",
+    "crates/langchart-runtime",
+    "crates/langchart-wasm",
+]
+
+# Docuvault is an opt-in integration. It remains a workspace member so it can
+# be developed and tested explicitly, but ordinary root-level Cargo commands
+# do not compile it or its Git dependency.
+default-members = [
+    "crates/langchart",
+    "crates/langchart-adapters",
+    "crates/langchart-artifact-fs",
+    "crates/langchart-checkpoint-redb",
+    "crates/langchart-cli",
+    "crates/langchart-context",
+    "crates/langchart-llm-genai",
+    "crates/langchart-llm-generic",
+    "crates/langchart-llm-watsonx",
+    "crates/langchart-mcp-client",
+    "crates/langchart-memory-redb",
+    "crates/langchart-model",
+    "crates/langchart-model-router",
+    "crates/langchart-runtime",
+    "crates/langchart-wasm",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+license      = "MIT OR Apache-2.0"
+authors      = ["langchart contributors"]
+repository   = "https://github.com/collaborite/langchart"
+
+[workspace.dependencies]
+# Internal crates
+langchart-model      = { path = "crates/langchart-model" }
+langchart-adapters   = { path = "crates/langchart-adapters" }
+langchart-runtime    = { path = "crates/langchart-runtime" }
+langchart-context    = { path = "crates/langchart-context" }
+langchart-docuvault  = { path = "crates/langchart-docuvault" }
+
+# Async
+tokio        = { version = "1", features = ["full"] }
+async-trait  = "0.1"
+futures      = "0.3"
+
+# Serialization
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+serde_yaml   = "0.9"
+ron          = "0.8"
+
+# CEL guard expressions
+cel-interpreter = "0.9"
+
+# IDs / time
+ulid         = "3"
+time         = { version = "0.3", features = ["serde"] }
+
+# Error handling
+thiserror    = "2"
+anyhow       = "1"
+
+# Tracing / observability
+tracing      = "0.1"
+
+# Testing
+proptest     = "1"
+criterion    = { version = "0.5", features = ["html_reports", "async_tokio"] }

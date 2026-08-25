@@ -1,0 +1,21 @@
+[package]
+name        = "langchart-model-router"
+description = "Policy-driven model router: dispatches LLM requests to registered LlmAdapter instances based on model profile rules."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[dependencies]
+langchart-adapters = { workspace = true }
+langchart-model    = { workspace = true }
+async-trait        = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

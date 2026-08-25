@@ -1,0 +1,30 @@
+[package]
+name        = "langchart-cli"
+description = "Command-line tools for langchart: validate, run, replay, inspect."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "langchart"
+path = "src/main.rs"
+
+[dependencies]
+langchart-model      = { workspace = true }
+langchart-adapters   = { workspace = true }
+langchart-runtime    = { workspace = true }
+langchart-checkpoint-redb = { path = "../langchart-checkpoint-redb" }
+
+clap         = { version = "4", features = ["derive"] }
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+serde_yaml   = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

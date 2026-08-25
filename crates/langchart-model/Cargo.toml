@@ -1,0 +1,22 @@
+[package]
+name        = "langchart-model"
+description = "Core statechart types, schema, validation, and CEL guard compilation. WASM-compatible."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[dependencies]
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+serde_yaml   = { workspace = true }
+ron          = { workspace = true }
+cel-interpreter = { workspace = true }
+thiserror    = { workspace = true }
+ulid         = { workspace = true }
+time         = { workspace = true }
+semver       = { version = "1", features = ["serde"] }
+
+# WASM note: no tokio, no async-trait, no std::fs, no std::thread, no std::net.
+# All data is passed in; the model layer is pure computation.

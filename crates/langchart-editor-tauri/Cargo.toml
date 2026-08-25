@@ -1,0 +1,30 @@
+[package]
+name = "langchart-editor-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone Tauri desktop editor for langchart workflows"
+
+[[bin]]
+name = "langchart-editor"
+path = "src/main.rs"
+
+[dependencies]
+langchart-model    = { workspace = true }
+langchart-runtime  = { workspace = true }
+langchart-adapters = { workspace = true }
+
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+rfd = "0.15"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

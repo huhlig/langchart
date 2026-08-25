@@ -1,0 +1,40 @@
+{
+  "name": "@langchart/editor",
+  "version": "0.1.0",
+  "description": "Visual statechart editor for langchart agentic workflows",
+  "private": true,
+  "type": "module",
+  "main": "dist/lib/lib.js",
+  "types": "dist/lib/lib.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/lib/lib.js",
+      "types": "./dist/lib/lib.d.ts"
+    },
+    "./lib": {
+      "import": "./dist/lib/lib.js",
+      "types": "./dist/lib/lib.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev":          "vite",
+    "build":        "tsc --noEmit && vite build",
+    "build:lib":    "tsc --noEmit && vite build --mode lib",
+    "preview":      "vite preview",
+    "typecheck":    "tsc --noEmit",
+    "wasm:build":         "wasm-pack build ../crates/langchart-wasm --target web --out-dir ../../editor/src/wasm --out-name langchart_wasm --dev",
+    "wasm:build:release": "wasm-pack build ../crates/langchart-wasm --target web --out-dir ../../editor/src/wasm --out-name langchart_wasm --release",
+    "build:full":         "npm run wasm:build && npm run build",
+    "build:full:release": "npm run wasm:build:release && npm run build"
+  },
+  "dependencies": {
+    "elkjs": "^0.9.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "vite": "^5.3.1"
+  }
+}

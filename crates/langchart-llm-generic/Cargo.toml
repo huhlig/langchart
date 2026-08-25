@@ -1,0 +1,27 @@
+[package]
+name        = "langchart-llm-generic"
+description = "OpenAI and Anthropic public API LlmAdapter for langchart. Supports model enumeration and any OpenAI-compatible endpoint."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[features]
+default  = ["openai", "anthropic"]
+openai   = []
+anthropic = []
+
+[dependencies]
+langchart-adapters = { workspace = true }
+langchart-model    = { workspace = true }
+async-trait        = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+reqwest            = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

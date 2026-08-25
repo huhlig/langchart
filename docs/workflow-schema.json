@@ -1,0 +1,558 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://langchart.dev/schema/workflow/1.0.0",
+  "title": "WorkflowDocument",
+  "description": "A langchart agentic statechart workflow document. Schema version 1.0.0.",
+  "type": "object",
+  "required": ["schema_version", "id", "version", "name", "states", "initial"],
+  "additionalProperties": true,
+  "properties": {
+
+    "schema_version": {
+      "type": "string",
+      "description": "SemVer string. Runtime rejects documents whose major version it does not understand.",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "examples": ["1.0.0"]
+    },
+
+    "id": {
+      "type": "string",
+      "description": "Stable slug identifier for this workflow definition. Never changes across renames.",
+      "examples": ["content-pipeline", "review-workflow"]
+    },
+
+    "version": {
+      "type": "string",
+      "description": "Semantic version of this workflow definition.",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "examples": ["1.0.0", "2.3.1"]
+    },
+
+    "name": {
+      "type": "string",
+      "description": "Human-readable display name."
+    },
+
+    "description": {
+      "type": "string",
+      "description": "Optional longer description."
+    },
+
+    "inputs": {
+      "type": "array",
+      "description": "Typed input ports for this workflow.",
+      "items": { "$ref": "#/$defs/InputPort" },
+      "default": []
+    },
+
+    "outputs": {
+      "type": "array",
+      "description": "Typed output ports for this workflow.",
+      "items": { "$ref": "#/$defs/OutputPort" },
+      "default": []
+    },
+
+    "data_schema": {
+      "$ref": "#/$defs/WorkflowDataSchema",
+      "description": "Declared types for workflow data variables.",
+      "default": { "fields": {} }
+    },
+
+    "policy": {
+      "$ref": "#/$defs/WorkflowPolicy",
+      "description": "Workflow-level policy applied to all states unless narrowed.",
+      "default": {}
+    },
+
+    "agents": {
+      "type": "array",
+      "description": "Inline agent definitions referenced by agentic states.",
+      "items": { "$ref": "#/$defs/AgentDefinition" },
+      "default": []
+    },
+
+    "states": {
+      "type": "array",
+      "description": "Top-level states in the statechart.",
+      "items": { "$ref": "#/$defs/StateDefinition" },
+      "minItems": 1
+    },
+
+    "initial": {
+      "type": "string",
+      "description": "ID of the initial top-level state."
+    },
+
+    "_editor": {
+      "description": "Non-semantic visual layout data. MUST NOT affect execution.",
+      "default": {}
+    }
+  },
+
+  "$defs": {
+
+    "InputPort": {
+      "type": "object",
+      "required": ["name", "type_sig", "required"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "type_sig": { "type": "string", "description": "RON type signature string, e.g. 'String', 'Option<u32>'." },
+        "required": { "type": "boolean" },
+        "description": { "type": "string" }
+      }
+    },
+
+    "OutputPort": {
+      "type": "object",
+      "required": ["name", "type_sig"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "type_sig": { "type": "string" },
+        "description": { "type": "string" }
+      }
+    },
+
+    "WorkflowDataSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "type": "object",
+          "description": "field_name → RON type signature.",
+          "additionalProperties": { "type": "string" },
+          "default": {}
+        }
+      }
+    },
+
+    "WorkflowPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_capabilities": {
+          "$ref": "#/$defs/CapabilityPolicy",
+          "description": "Maximum allowed capability policy across all states.",
+          "default": {}
+        },
+        "unhandled_event_is_failure": {
+          "type": "boolean",
+          "description": "If true, an unhandled event at the workflow level is a run failure.",
+          "default": false
+        }
+      }
+    },
+
+    "AgentDefinition": {
+      "type": "object",
+      "required": ["id", "version", "description", "system_prompt", "model_policy", "output_events"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "description": "Stable agent identifier." },
+        "version": { "type": "string", "description": "SemVer version string." },
+        "description": { "type": "string" },
+        "system_prompt": { "type": "string", "description": "Path or inline content of the system prompt template." },
+        "model_policy": { "$ref": "#/$defs/ModelPolicy" },
+        "default_context_policy": { "$ref": "#/$defs/ContextPolicy", "default": {} },
+        "default_capabilities": { "$ref": "#/$defs/CapabilityPolicy", "default": {} },
+        "output_events": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Declared output event type names this agent may emit."
+        }
+      }
+    },
+
+    "StateDefinition": {
+      "type": "object",
+      "required": ["id", "name", "type"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "description": "Stable slug identity. Never changes when display name does." },
+        "name": { "type": "string", "description": "Human-readable display name." },
+        "type": {
+          "type": "string",
+          "enum": ["atomic", "agentic", "compound", "parallel", "human", "subworkflow", "final"],
+          "description": "Fundamental state kind."
+        },
+
+        "agent": { "$ref": "#/$defs/AgentRef", "description": "Agent to invoke (agentic states only)." },
+        "prompt": { "type": "string", "description": "Static task prompt appended to agent system instructions." },
+        "input": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Workflow-data expressions mapped to agent input fields.",
+          "default": {}
+        },
+        "context": { "$ref": "#/$defs/ContextPolicy", "description": "Context policy for this state." },
+        "model": { "$ref": "#/$defs/ModelPolicy", "description": "Model policy override." },
+        "capabilities": { "$ref": "#/$defs/CapabilityPolicy", "description": "Capability policy for this state." },
+        "limits": { "$ref": "#/$defs/ExecutionLimits", "description": "Execution resource limits." },
+
+        "states": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/StateDefinition" },
+          "description": "Child states (compound and parallel).",
+          "default": []
+        },
+        "regions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ParallelRegion" },
+          "description": "Named orthogonal regions (parallel states only).",
+          "default": []
+        },
+        "completion": {
+          "$ref": "#/$defs/ParallelCompletion",
+          "description": "Parallel completion mode (parallel states only)."
+        },
+        "history": {
+          "type": "string",
+          "enum": ["shallow", "deep"],
+          "description": "History mode (compound and parallel states only)."
+        },
+        "initial": { "type": "string", "description": "ID of the initial child state (compound states only)." },
+
+        "workflow_ref": {
+          "type": "string",
+          "description": "workflow_id@version reference (subworkflow states only).",
+          "examples": ["content-review@2.1"]
+        },
+        "ports": { "$ref": "#/$defs/PortBinding", "description": "Port bindings (subworkflow states only)." },
+
+        "authorized_roles": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Roles or identities required to fulfill a human state.",
+          "default": []
+        },
+
+        "on_entry": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "CEL expressions evaluated as entry actions (pure data transforms).",
+          "default": []
+        },
+        "on_exit": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "CEL expressions evaluated as exit actions (pure data transforms).",
+          "default": []
+        },
+        "retry": { "$ref": "#/$defs/RetryPolicy", "description": "Retry policy for this state's activity." },
+        "timeout": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wall-clock timeout in seconds for this state's activity."
+        },
+
+        "on": {
+          "type": "object",
+          "description": "Outbound transitions keyed by event type. Values are arrays of TransitionSpec evaluated in priority order.",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/TransitionSpec" }
+          },
+          "default": {}
+        },
+        "output_schemas": {
+          "type": "object",
+          "description": "Payload schemas for output events emitted by this state. Keys are event type names.",
+          "additionalProperties": { "$ref": "#/$defs/EventSchema" },
+          "default": {}
+        },
+
+        "_editor": {
+          "description": "Non-semantic visual layout data. MUST NOT affect execution.",
+          "default": {}
+        }
+      }
+    },
+
+    "AgentRef": {
+      "type": "object",
+      "required": ["id", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+
+    "ParallelRegion": {
+      "type": "object",
+      "required": ["id", "name", "initial", "states"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "initial": { "type": "string" },
+        "states": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/StateDefinition" }
+        }
+      }
+    },
+
+    "ParallelCompletion": {
+      "type": "object",
+      "required": ["mode"],
+      "description": "Determines when a parallel state is considered complete.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["all", "any", "quorum", "guard", "manual"]
+        },
+        "n": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Required when mode is 'quorum'."
+        },
+        "expr": {
+          "type": "string",
+          "description": "CEL expression. Required when mode is 'guard'."
+        }
+      },
+      "examples": [
+        { "mode": "all" },
+        { "mode": "any" },
+        { "mode": "quorum", "n": 2 },
+        { "mode": "guard", "expr": "completions >= 2" },
+        { "mode": "manual" }
+      ]
+    },
+
+    "PortBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "child_field_name → workflow-data expression evaluated at invocation time.",
+          "default": {}
+        },
+        "output": {
+          "type": "object",
+          "description": "Maps child output event type → field-level bindings written to caller data.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "default": {}
+        }
+      }
+    },
+
+    "TransitionSpec": {
+      "type": "object",
+      "required": ["target"],
+      "additionalProperties": false,
+      "properties": {
+        "target": { "type": "string", "description": "Target state ID." },
+        "guard": { "type": "string", "description": "CEL guard expression. Absence means always-true." },
+        "priority": {
+          "type": "integer",
+          "description": "Lower integer = higher priority. Default 0.",
+          "default": 0
+        },
+        "actions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "CEL data-transform expressions evaluated during the transition.",
+          "default": []
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["external", "internal", "local"],
+          "description": "Transition kind. Default: external.",
+          "default": "external"
+        }
+      }
+    },
+
+    "EventSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "type": "object",
+          "description": "field_name → JSON type name ('string','number','boolean','array','object','null'). All declared fields are required in the payload.",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["string", "number", "boolean", "array", "object", "null"]
+          },
+          "default": {}
+        }
+      }
+    },
+
+    "ModelPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Selects which LLM model or profile to use.",
+      "properties": {
+        "profile": { "type": "string", "description": "Named model profile, e.g. 'high_quality', 'fast'." },
+        "model": { "type": "string", "description": "Explicit model name overriding the profile." },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "max_tokens": { "type": "integer", "minimum": 1 }
+      }
+    },
+
+    "ExecutionLimits": {
+      "type": "object",
+      "required": ["max_turns", "max_tool_calls", "timeout"],
+      "additionalProperties": false,
+      "properties": {
+        "max_turns": { "type": "integer", "minimum": 1, "description": "Maximum LLM turns per invocation." },
+        "max_tool_calls": { "type": "integer", "minimum": 0, "description": "Maximum MCP tool calls per invocation." },
+        "timeout": { "type": "integer", "minimum": 1, "description": "Wall-clock timeout in seconds." },
+        "max_tokens_total": { "type": "integer", "minimum": 1, "description": "Max total tokens across all LLM calls." }
+      }
+    },
+
+    "RetryPolicy": {
+      "type": "object",
+      "required": ["max_attempts", "delay", "backoff"],
+      "additionalProperties": false,
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1, "description": "Maximum attempts including the first." },
+        "delay": { "type": "integer", "minimum": 0, "description": "Initial retry delay in seconds." },
+        "backoff": {
+          "type": "string",
+          "enum": ["fixed", "linear", "exponential"],
+          "description": "Backoff strategy for successive retries."
+        },
+        "retryable_on": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Event types or error classes that allow retry. Empty = all failures.",
+          "default": []
+        },
+        "fallback_model": { "type": "string", "description": "Alternative model profile for retry attempts." },
+        "on_exhausted": { "type": "string", "description": "Target state when all attempts are exhausted." }
+      }
+    },
+
+    "ContextPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sources": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextSource" },
+          "description": "Ordered list of context sources to resolve.",
+          "default": []
+        },
+        "token_budget": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum tokens the assembled context may consume."
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Fields or sections to explicitly exclude.",
+          "default": []
+        }
+      }
+    },
+
+    "ContextSource": {
+      "type": "object",
+      "required": ["type"],
+      "description": "One source of information in the context resolution pipeline.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": { "const": "artifact" },
+            "selector": { "type": "string", "description": "Artifact selector expression." },
+            "version": { "type": "string", "description": "Specific version; omit for current version." }
+          },
+          "required": ["type", "selector"]
+        },
+        {
+          "properties": {
+            "type": { "const": "memory" },
+            "query": { "type": "string", "description": "Memory query string." },
+            "limit": { "type": "integer", "minimum": 1, "default": 10 }
+          },
+          "required": ["type", "query"]
+        },
+        {
+          "properties": {
+            "type": { "const": "workflow_data" },
+            "expression": { "type": "string", "description": "Workflow data expression to inline." }
+          },
+          "required": ["type", "expression"]
+        }
+      ]
+    },
+
+    "CapabilityPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mcp": {
+          "type": "object",
+          "description": "Per-MCP-server tool and resource allowlists. Keys are server IDs.",
+          "additionalProperties": { "$ref": "#/$defs/McpServerPolicy" },
+          "default": {}
+        },
+        "memory_write": {
+          "type": "boolean",
+          "description": "Whether the agent may write to long-term memory.",
+          "default": false
+        },
+        "elevate": {
+          "type": "boolean",
+          "description": "Explicit elevation above the parent policy. Flagged by the validator.",
+          "default": false
+        }
+      }
+    },
+
+    "McpServerPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Explicitly allowed tool names. Empty means none allowed."
+        },
+        "resource_patterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Allowed resource URI patterns (glob or regex string).",
+          "default": []
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["read", "propose", "commit", "publish", "delete"]
+          },
+          "description": "Operation classes permitted on resources.",
+          "default": []
+        },
+        "call_budget": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum tool calls to this server in one invocation."
+        },
+        "credentials": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Named secret references injected into calls to this server.",
+          "default": []
+        },
+        "require_human_confirmation": {
+          "type": "boolean",
+          "description": "If true, broker pauses before forwarding and emits a confirmation event.",
+          "default": false
+        }
+      }
+    }
+  }
+}

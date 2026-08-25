@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>langchart — Agentic Statechart Editor</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <!-- ── Toolbar (standalone shell — not part of the library) ──────────────── -->
+  <header class="toolbar">
+    <span class="toolbar-brand">langchart editor</span>
+    <span id="schema-version" class="toolbar-schema"></span>
+    <span id="document-status" class="document-status" aria-live="polite">Ready</span>
+    <div class="toolbar-actions">
+      <button id="btn-new" class="btn" title="New workflow (Ctrl/Cmd+N)">New</button>
+      <button id="btn-import" class="btn" title="Open workflow (Ctrl/Cmd+O)">Open</button>
+      <button id="btn-export" class="btn" title="Export .langchart file (Ctrl/Cmd+S)">Export .langchart</button>
+      <button id="btn-compile" class="btn btn--primary">Compile Check</button>
+    </div>
+  </header>
+
+  <!-- ── Editor mount point ───────────────────────────────────────────────── -->
+  <div id="editor-root" style="flex:1;min-height:0;overflow:hidden;"></div>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

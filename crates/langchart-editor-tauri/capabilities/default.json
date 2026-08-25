@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Default permissions for the langchart editor",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open"
+  ]
+}
