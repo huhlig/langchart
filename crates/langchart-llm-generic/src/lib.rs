@@ -18,6 +18,9 @@
 //!     .anthropic_api_key("sk-ant-...")
 //!     .build()?;
 //! ```
+
+// The public adapter trait returns the shared, diagnostic-rich LlmError by value.
+#![allow(clippy::result_large_err)]
 //!
 //! For Azure / Ollama / vLLM:
 //!
@@ -28,22 +31,22 @@
 //!     .build()?;
 //! ```
 
-use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZstdDecoder};
+use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
 use async_trait::async_trait;
 use bytes::Bytes;
 use eventsource_stream::Eventsource;
-use futures::stream::{self, Stream, StreamExt};
 use futures::TryStreamExt;
+use futures::stream::{self, Stream, StreamExt};
 use langchart_adapters::llm::{
     FinishReason, LlmAdapter, LlmError, LlmEventStream, LlmRequest, LlmResponse, LlmStreamEvent,
     Message, ModelInfo, ResponseBodyMetadata, ResponseFormat, TokenUsage, ToolCall, ToolDefinition,
-    TransportStage, buffered_response_stream,
+    TransportStage,
 };
 use reqwest::header::HeaderMap;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{Cursor, Read};
 use std::pin::Pin;
@@ -68,6 +71,7 @@ const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENCODED_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const ACCEPTED_CONTENT_ENCODINGS: &str = "gzip, br, deflate, zstd";
 const MAX_EVENT_QUEUE_DEPTH: usize = 64;
+type ByteResultStream = Pin<Box<dyn Stream<Item = Result<Bytes, LlmError>> + Send>>;
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
@@ -164,9 +168,7 @@ impl GenericLlmAdapterBuilder {
             openai_base_url: self
                 .openai_base_url
                 .unwrap_or_else(|| OPENAI_BASE_URL.to_string()),
-            max_retries: self
-                .max_retries
-                .unwrap_or(DEFAULT_MAX_RETRIES),
+            max_retries: self.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             max_response_body_bytes: self
                 .max_response_body_bytes
                 .unwrap_or(DEFAULT_MAX_RESPONSE_BODY_BYTES),
@@ -268,10 +270,11 @@ impl GenericLlmAdapter {
                     });
 
                     // Don't wait past the deadline.
-                    let remaining = total_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining =
+                        total_deadline.saturating_duration_since(tokio::time::Instant::now());
                     let wait = delay.min(remaining);
 
-                    if wait.is_zero() {
+                    if wait.is_zero() && tokio::time::Instant::now() >= total_deadline {
                         return Err(generation_timeout_error(
                             "total generation deadline exceeded during retry backoff",
                         ));
@@ -283,7 +286,9 @@ impl GenericLlmAdapter {
                         delay_ms = wait.as_millis(),
                         "retrying after transient error"
                     );
-                    tokio::time::sleep(wait).await;
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
                 }
                 Err(e) => return Err(e),
                 Ok(response) => return Ok(response),
@@ -303,8 +308,7 @@ impl LlmAdapter for GenericLlmAdapter {
             .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
         if Self::is_anthropic_model(&model) {
-            let total_deadline =
-                tokio::time::Instant::now() + self.total_generation_timeout;
+            let total_deadline = tokio::time::Instant::now() + self.total_generation_timeout;
             let model = model.clone();
             self.with_retry(total_deadline, || {
                 let model = model.clone();
@@ -313,8 +317,7 @@ impl LlmAdapter for GenericLlmAdapter {
             })
             .await
         } else {
-            let total_deadline =
-                tokio::time::Instant::now() + self.total_generation_timeout;
+            let total_deadline = tokio::time::Instant::now() + self.total_generation_timeout;
             let model = model.clone();
             self.with_retry(total_deadline, || {
                 let model = model.clone();
@@ -333,19 +336,19 @@ impl LlmAdapter for GenericLlmAdapter {
             .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
         if Self::is_anthropic_model(&model) {
-            let total_deadline =
-                tokio::time::Instant::now() + self.total_generation_timeout;
+            let total_deadline = tokio::time::Instant::now() + self.total_generation_timeout;
             let model = model.clone();
-            let response = self.with_retry(total_deadline, || {
+            self.with_retry(total_deadline, || {
                 let model = model.clone();
                 let request = request.clone();
-                async move { self.complete_anthropic(&model, &request).await }
+                async move {
+                    self.complete_anthropic_stream(&model, &request, total_deadline)
+                        .await
+                }
             })
-            .await?;
-            Ok(buffered_response_stream(response))
+            .await
         } else {
-            let total_deadline =
-                tokio::time::Instant::now() + self.total_generation_timeout;
+            let total_deadline = tokio::time::Instant::now() + self.total_generation_timeout;
             let model = model.clone();
             self.with_retry(total_deadline, || {
                 let model = model.clone();
@@ -640,7 +643,10 @@ impl GenericLlmAdapter {
             .map_err(|_| generation_timeout_error("response headers deadline exceeded"))?
             .map_err(|error| http_to_llm_err(&error))?;
 
-        let oai: OaiResponse = self.decode_response(response).await?;
+        let oai: OaiResponse =
+            tokio::time::timeout_at(total_deadline, self.decode_response(response))
+                .await
+                .map_err(|_| generation_timeout_error("total generation deadline exceeded"))??;
 
         let mut text_content: Option<String> = None;
         let mut refusal: Option<String> = None;
@@ -816,6 +822,8 @@ struct AnthropicRequest {
     tools: Vec<AnthropicTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "is_false")]
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -935,23 +943,35 @@ impl GenericLlmAdapter {
             system,
             tools,
             temperature: req.model_policy.temperature,
+            stream: false,
         };
 
         debug!(model = model, "anthropic request");
 
         let url = format!("{}/messages", ANTHROPIC_BASE_URL);
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header(reqwest::header::ACCEPT_ENCODING, ACCEPTED_CONTENT_ENCODINGS)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| http_to_llm_err(&e))?;
+        let total_deadline = tokio::time::Instant::now() + self.total_generation_timeout;
+        let headers_deadline = std::cmp::min(
+            total_deadline,
+            tokio::time::Instant::now() + self.first_byte_timeout,
+        );
+        let resp = tokio::time::timeout_at(
+            headers_deadline,
+            self.client
+                .post(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header(reqwest::header::ACCEPT_ENCODING, ACCEPTED_CONTENT_ENCODINGS)
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| generation_timeout_error("response headers deadline exceeded"))?
+        .map_err(|error| http_to_llm_err(&error))?;
 
-        let anthropic: AnthropicResponse = self.decode_response(resp).await?;
+        let anthropic: AnthropicResponse =
+            tokio::time::timeout_at(total_deadline, self.decode_response(resp))
+                .await
+                .map_err(|_| generation_timeout_error("total generation deadline exceeded"))??;
 
         let mut text_content: Option<String> = None;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -997,6 +1017,111 @@ impl GenericLlmAdapter {
             model: model.to_string(),
             reported_model: Some(anthropic.model),
         })
+    }
+
+    async fn complete_anthropic_stream(
+        &self,
+        model: &str,
+        req: &LlmRequest,
+        total_deadline: tokio::time::Instant,
+    ) -> Result<LlmEventStream, LlmError> {
+        if !matches!(req.response_format, ResponseFormat::Text) {
+            return Err(LlmError::UnsupportedResponseFormat {
+                adapter: "anthropic".into(),
+                requested: req.response_format.kind(),
+            });
+        }
+        let api_key = self
+            .anthropic_api_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| LlmError::Provider("ANTHROPIC_API_KEY not configured".into()))?;
+
+        let mut system = None;
+        let mut messages = Vec::new();
+        for message in &req.messages {
+            match message {
+                Message::System { content } => system = Some(content.clone()),
+                Message::User { content } => messages.push(AnthropicMessage {
+                    role: "user",
+                    content: serde_json::Value::String(content.clone()),
+                }),
+                Message::Assistant { content } => messages.push(AnthropicMessage {
+                    role: "assistant",
+                    content: serde_json::Value::String(content.clone()),
+                }),
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } => messages.push(AnthropicMessage {
+                    role: "user",
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": content
+                    }]),
+                }),
+            }
+        }
+        let body = AnthropicRequest {
+            model: model.to_string(),
+            max_tokens: req.model_policy.max_tokens.unwrap_or(4096),
+            messages,
+            system,
+            tools: req
+                .tools
+                .iter()
+                .map(|tool| AnthropicTool {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    input_schema: tool.parameters.clone(),
+                })
+                .collect(),
+            temperature: req.model_policy.temperature,
+            stream: true,
+        };
+
+        let headers_deadline = std::cmp::min(
+            total_deadline,
+            tokio::time::Instant::now() + self.first_byte_timeout,
+        );
+        let response = tokio::time::timeout_at(
+            headers_deadline,
+            self.client
+                .post(format!("{ANTHROPIC_BASE_URL}/messages"))
+                .header("x-api-key", api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .header(reqwest::header::ACCEPT_ENCODING, ACCEPTED_CONTENT_ENCODINGS)
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| generation_timeout_error("response headers deadline exceeded"))?
+        .map_err(|error| http_to_llm_err(&error))?;
+
+        if !response.status().is_success() {
+            return self
+                .decode_response::<serde_json::Value>(response)
+                .await
+                .and_then(|_| Err(LlmError::Provider("unexpected error response".into())));
+        }
+        let request_id = response_request_id(response.headers());
+        let metadata = response_metadata(response.headers());
+        let bytes = decoded_streaming_body(
+            response,
+            self.max_encoded_response_body_bytes,
+            self.max_response_body_bytes,
+            self.first_byte_timeout,
+            self.stream_idle_timeout,
+            total_deadline,
+        )?;
+        Ok(anthropic_event_stream(
+            bytes.eventsource(),
+            model.to_string(),
+            request_id,
+            metadata,
+        ))
     }
 
     async fn decode_response<T: DeserializeOwned>(
@@ -1414,7 +1539,7 @@ fn decoded_streaming_body(
     first_byte_timeout: Duration,
     idle_timeout: Duration,
     total_deadline: tokio::time::Instant,
-) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, LlmError>> + Send>>, LlmError> {
+) -> Result<ByteResultStream, LlmError> {
     let status = response.status().as_u16();
     let metadata = response_metadata(response.headers());
     let content_encoding = metadata.content_encoding.clone();
@@ -1431,14 +1556,12 @@ fn decoded_streaming_body(
     let encoded_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let encoded_counter = encoded_bytes.clone();
     let raw = raw.map(move |result| {
-        result.map(|bytes| {
+        result.inspect(|bytes| {
             encoded_counter.fetch_add(bytes.len(), std::sync::atomic::Ordering::Relaxed);
-            bytes
         })
     });
 
-    let stream_reader =
-        StreamReader::new(raw.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let stream_reader = StreamReader::new(raw.map_err(std::io::Error::other));
     let mut reader: Pin<Box<dyn AsyncBufRead + Send + Unpin>> =
         Box::pin(BufReader::new(stream_reader));
 
@@ -1451,10 +1574,7 @@ fn decoded_streaming_body(
             // `prev` becomes the input to the decoder; the replacement is a
             // no-op BufReader (its content doesn't matter since it will be
             // overwritten or dropped on the next iteration / after the loop).
-            let prev = std::mem::replace(
-                &mut reader,
-                Box::pin(BufReader::new(tokio::io::empty())),
-            );
+            let prev = std::mem::replace(&mut reader, Box::pin(BufReader::new(tokio::io::empty())));
             reader = match *enc {
                 e if e.eq_ignore_ascii_case("gzip") || e.eq_ignore_ascii_case("x-gzip") => {
                     Box::pin(BufReader::new(GzipDecoder::new(BufReader::new(prev))))
@@ -1463,7 +1583,7 @@ fn decoded_streaming_body(
                     Box::pin(BufReader::new(BrotliDecoder::new(BufReader::new(prev))))
                 }
                 e if e.eq_ignore_ascii_case("deflate") => {
-                    Box::pin(BufReader::new(DeflateDecoder::new(BufReader::new(prev))))
+                    Box::pin(BufReader::new(ZlibDecoder::new(BufReader::new(prev))))
                 }
                 e if e.eq_ignore_ascii_case("zstd") => {
                     Box::pin(BufReader::new(ZstdDecoder::new(BufReader::new(prev))))
@@ -1521,16 +1641,15 @@ fn decoded_streaming_body(
         if tokio::time::Instant::now() >= total_deadline {
             st.done = true;
             return Some((
-                Err(generation_timeout_error("total generation deadline exceeded")),
+                Err(generation_timeout_error(
+                    "total generation deadline exceeded",
+                )),
                 st,
             ));
         }
-        let wait = if st.seen_first {
-            idle
-        } else {
-            initial_wait
-        };
-        match tokio::time::timeout(wait, st.stream.next()).await {
+        let wait = if st.seen_first { idle } else { initial_wait };
+        let deadline = std::cmp::min(total_deadline, tokio::time::Instant::now() + wait);
+        match tokio::time::timeout_at(deadline, st.stream.next()).await {
             Err(_elapsed) => {
                 st.done = true;
                 Some((Err(LlmError::Timeout), st))
@@ -1542,9 +1661,7 @@ fn decoded_streaming_body(
             }
             Ok(Some(Ok(bytes))) => {
                 st.seen_first = true;
-                let encoded = st
-                    .encoded_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let encoded = st.encoded_bytes.load(std::sync::atomic::Ordering::Relaxed);
                 if encoded > max_encoded_bytes {
                     st.done = true;
                     Some((
@@ -1681,30 +1798,27 @@ where
                 }
                 for tc in choice.delta.tool_calls {
                     let slot = if tc.index >= self.tool_calls.len() {
-                        self.tool_calls.resize(
-                            tc.index + 1,
-                            (String::new(), String::new(), String::new()),
-                        );
+                        self.tool_calls
+                            .resize(tc.index + 1, (String::new(), String::new(), String::new()));
                         self.tool_calls.last_mut().unwrap()
                     } else {
                         &mut self.tool_calls[tc.index]
                     };
-                    let is_start =
-                        tc.id.is_some() || (slot.0.is_empty() && slot.1.is_empty());
+                    let is_start = tc.id.is_some() || (slot.0.is_empty() && slot.1.is_empty());
                     if is_start {
-                        if let Some(open) = self.open_tool.take() {
-                            if open != tc.index {
-                                self.queue
-                                    .push_back(Ok(LlmStreamEvent::ToolCallEnd { index: open }));
-                            }
+                        if let Some(open) = self.open_tool.take()
+                            && open != tc.index
+                        {
+                            self.queue
+                                .push_back(Ok(LlmStreamEvent::ToolCallEnd { index: open }));
                         }
                         if let Some(id) = tc.id {
                             slot.0 = id;
                         }
-                        if let Some(function) = &tc.function {
-                            if let Some(name) = &function.name {
-                                slot.1 = name.clone();
-                            }
+                        if let Some(function) = &tc.function
+                            && let Some(name) = &function.name
+                        {
+                            slot.1 = name.clone();
                         }
                         self.open_tool = Some(tc.index);
                         self.queue.push_back(Ok(LlmStreamEvent::ToolCallStart {
@@ -1713,15 +1827,15 @@ where
                             name: (!slot.1.is_empty()).then(|| slot.1.clone()),
                         }));
                     }
-                    if let Some(function) = tc.function {
-                        if let Some(args) = function.arguments {
-                            slot.2.push_str(&args);
-                            self.queue
-                                .push_back(Ok(LlmStreamEvent::ToolCallArgumentsDelta {
-                                    index: tc.index,
-                                    delta: args,
-                                }));
-                        }
+                    if let Some(function) = tc.function
+                        && let Some(args) = function.arguments
+                    {
+                        slot.2.push_str(&args);
+                        self.queue
+                            .push_back(Ok(LlmStreamEvent::ToolCallArgumentsDelta {
+                                index: tc.index,
+                                delta: args,
+                            }));
                     }
                 }
                 if let Some(finish_reason) = choice.finish_reason {
@@ -1743,60 +1857,60 @@ where
             } else {
                 Some(self.content.clone())
             };
-            let tool_calls: Vec<ToolCall> = self
-                .tool_calls
-                .iter()
-                .map(|(id, name, args)| ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: serde_json::from_str(args)
-                        .unwrap_or_else(|_| serde_json::Value::String(args.clone())),
-                })
-                .collect();
-            if !content.is_none() {
-                if let ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. } =
-                    self.response_format
-                {
-                    if let Err(e) =
-                        serde_json::from_str::<serde_json::Value>(content.as_ref().unwrap())
-                    {
+            let mut tool_calls = Vec::with_capacity(self.tool_calls.len());
+            for (id, name, args) in &self.tool_calls {
+                let arguments = match serde_json::from_str(args) {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
                         self.done = true;
-                        self.queue.push_back(Err(LlmError::Decode {
-                            status: 200,
-                            content_type: None,
-                            content_encoding: None,
-                            body_len: self.received_bytes,
-                            body_hash: String::new(),
-                            json_path: None,
-                            cause: format!(
-                                "structured response content is not valid JSON: {e}"
-                            ),
-                            likely_truncated: matches!(
-                                self.finish,
-                                Some(FinishReason::Length)
-                            ),
-                        }));
+                        self.queue.push_back(Err(
+                            self.decode_error(format!("invalid streamed tool arguments: {error}"))
+                        ));
                         return;
                     }
-                }
+                };
+                tool_calls.push(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments,
+                });
+            }
+            if let Some(content_text) = content.as_ref()
+                && matches!(
+                    self.response_format,
+                    ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. }
+                )
+                && let Err(e) = serde_json::from_str::<serde_json::Value>(content_text)
+            {
+                self.done = true;
+                self.queue.push_back(Err(LlmError::Decode {
+                    status: 200,
+                    content_type: None,
+                    content_encoding: None,
+                    body_len: self.received_bytes,
+                    body_hash: String::new(),
+                    json_path: None,
+                    cause: format!("structured response content is not valid JSON: {e}"),
+                    likely_truncated: matches!(self.finish, Some(FinishReason::Length)),
+                }));
+                return;
             }
             self.done = true;
-            self.queue
-                .push_back(Ok(LlmStreamEvent::ResponseCompleted {
-                    response: LlmResponse {
-                        content,
-                        tool_calls,
-                        usage: self.usage.clone().unwrap_or_default(),
-                        finish_reason: self.finish.clone().unwrap_or(FinishReason::Stop),
-                        refusal: if self.refusal.is_empty() {
-                            None
-                        } else {
-                            Some(self.refusal.clone())
-                        },
-                        model: self.model.clone(),
-                        reported_model: self.reported_model.clone(),
+            self.queue.push_back(Ok(LlmStreamEvent::ResponseCompleted {
+                response: LlmResponse {
+                    content,
+                    tool_calls,
+                    usage: self.usage.clone().unwrap_or_default(),
+                    finish_reason: self.finish.clone().unwrap_or(FinishReason::Stop),
+                    refusal: if self.refusal.is_empty() {
+                        None
+                    } else {
+                        Some(self.refusal.clone())
                     },
-                }));
+                    model: self.model.clone(),
+                    reported_model: self.reported_model.clone(),
+                },
+            }));
         }
 
         fn decode_error(&self, cause: String) -> LlmError {
@@ -1837,13 +1951,13 @@ where
     Box::pin(stream::unfold(state, |mut st| async move {
         loop {
             // Backpressure: drain queued events before reading more from upstream.
-            if st.queue.len() >= MAX_EVENT_QUEUE_DEPTH {
-                if let Some(item) = st.queue.pop_front() {
-                    if item.is_err() {
-                        st.done = true;
-                    }
-                    return Some((item, st));
+            if st.queue.len() >= MAX_EVENT_QUEUE_DEPTH
+                && let Some(item) = st.queue.pop_front()
+            {
+                if item.is_err() {
+                    st.done = true;
                 }
+                return Some((item, st));
             }
 
             if let Some(item) = st.queue.pop_front() {
@@ -1859,11 +1973,6 @@ where
                 None => {
                     if st.finish_event_seen {
                         return None;
-                    }
-                    if st.finish.is_some() {
-                        st.finish_event_seen = true;
-                        st.finalize();
-                        continue;
                     }
                     st.done = true;
                     return Some((
@@ -1905,9 +2014,7 @@ where
                     if event.event.as_str() == "error" {
                         st.done = true;
                         return Some((
-                            Err(LlmError::Provider(format!(
-                                "provider error event: {data}"
-                            ))),
+                            Err(LlmError::Provider(format!("provider error event: {data}"))),
                             st,
                         ));
                     }
@@ -1931,10 +2038,284 @@ where
     }))
 }
 
+fn anthropic_event_stream<S>(
+    stream: S,
+    model: String,
+    request_id: Option<String>,
+    metadata: ResponseBodyMetadata,
+) -> LlmEventStream
+where
+    S: Stream<
+            Item = Result<
+                eventsource_stream::Event,
+                eventsource_stream::EventStreamError<LlmError>,
+            >,
+        > + Send
+        + Unpin
+        + 'static,
+{
+    struct State<S> {
+        stream: S,
+        queue: VecDeque<Result<LlmStreamEvent, LlmError>>,
+        model: String,
+        request_id: Option<String>,
+        metadata: ResponseBodyMetadata,
+        reported_model: Option<String>,
+        content: String,
+        tools: BTreeMap<usize, (String, String, String)>,
+        usage: TokenUsage,
+        finish: Option<FinishReason>,
+        received_bytes: usize,
+        started: bool,
+        stopped: bool,
+        done: bool,
+    }
+
+    impl<S> State<S> {
+        fn decode_error(&self, cause: String) -> LlmError {
+            LlmError::Decode {
+                status: 200,
+                content_type: self.metadata.content_type.clone(),
+                content_encoding: self.metadata.content_encoding.clone(),
+                body_len: self.received_bytes,
+                body_hash: String::new(),
+                json_path: None,
+                cause,
+                likely_truncated: false,
+            }
+        }
+
+        fn start(&mut self) {
+            if !self.started {
+                self.started = true;
+                self.queue.push_back(Ok(LlmStreamEvent::ResponseStarted {
+                    request_id: self.request_id.clone(),
+                    reported_model: self.reported_model.clone(),
+                }));
+            }
+        }
+
+        fn apply(&mut self, value: &serde_json::Value) -> Result<(), LlmError> {
+            let kind = value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match kind {
+                "message_start" => {
+                    let message = &value["message"];
+                    self.reported_model = message["model"].as_str().map(str::to_owned);
+                    if let Some(input) = message["usage"]["input_tokens"].as_u64() {
+                        self.usage.prompt_tokens = u32::try_from(input).unwrap_or(u32::MAX);
+                    }
+                    if let Some(output) = message["usage"]["output_tokens"].as_u64() {
+                        self.usage.completion_tokens = u32::try_from(output).unwrap_or(u32::MAX);
+                    }
+                    self.usage.total_tokens = self
+                        .usage
+                        .prompt_tokens
+                        .saturating_add(self.usage.completion_tokens);
+                    self.start();
+                }
+                "content_block_start" => {
+                    self.start();
+                    let index = value["index"].as_u64().unwrap_or(0) as usize;
+                    let block = &value["content_block"];
+                    if block["type"].as_str() == Some("tool_use") {
+                        let id = block["id"].as_str().unwrap_or_default().to_owned();
+                        let name = block["name"].as_str().unwrap_or_default().to_owned();
+                        self.tools
+                            .insert(index, (id.clone(), name.clone(), String::new()));
+                        self.queue.push_back(Ok(LlmStreamEvent::ToolCallStart {
+                            index,
+                            id: (!id.is_empty()).then_some(id),
+                            name: (!name.is_empty()).then_some(name),
+                        }));
+                    }
+                }
+                "content_block_delta" => {
+                    self.start();
+                    let index = value["index"].as_u64().unwrap_or(0) as usize;
+                    let delta = &value["delta"];
+                    match delta["type"].as_str() {
+                        Some("text_delta") => {
+                            if let Some(text) = delta["text"].as_str() {
+                                self.content.push_str(text);
+                                self.queue.push_back(Ok(LlmStreamEvent::TextDelta {
+                                    delta: text.to_owned(),
+                                }));
+                            }
+                        }
+                        Some("thinking_delta") => {
+                            if let Some(thinking) = delta["thinking"].as_str() {
+                                self.queue.push_back(Ok(LlmStreamEvent::ReasoningDelta {
+                                    delta: thinking.to_owned(),
+                                }));
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(fragment) = delta["partial_json"].as_str() {
+                                let Some(tool) = self.tools.get_mut(&index) else {
+                                    return Err(self.decode_error(format!(
+                                        "tool argument delta for unknown content block {index}"
+                                    )));
+                                };
+                                tool.2.push_str(fragment);
+                                self.queue
+                                    .push_back(Ok(LlmStreamEvent::ToolCallArgumentsDelta {
+                                        index,
+                                        delta: fragment.to_owned(),
+                                    }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "content_block_stop" => {
+                    let index = value["index"].as_u64().unwrap_or(0) as usize;
+                    if self.tools.contains_key(&index) {
+                        self.queue
+                            .push_back(Ok(LlmStreamEvent::ToolCallEnd { index }));
+                    }
+                }
+                "message_delta" => {
+                    if let Some(output) = value["usage"]["output_tokens"].as_u64() {
+                        self.usage.completion_tokens = u32::try_from(output).unwrap_or(u32::MAX);
+                        self.usage.total_tokens = self
+                            .usage
+                            .prompt_tokens
+                            .saturating_add(self.usage.completion_tokens);
+                        self.queue.push_back(Ok(LlmStreamEvent::UsageUpdate {
+                            usage: self.usage.clone(),
+                        }));
+                    }
+                    if let Some(reason) = value["delta"]["stop_reason"].as_str() {
+                        let reason = parse_anthropic_finish_reason(reason);
+                        self.finish = Some(reason.clone());
+                        self.queue
+                            .push_back(Ok(LlmStreamEvent::FinishReason { reason }));
+                    }
+                }
+                "message_stop" => {
+                    self.stopped = true;
+                    let mut tool_calls = Vec::with_capacity(self.tools.len());
+                    for (id, name, arguments) in self.tools.values() {
+                        let arguments = serde_json::from_str(arguments).map_err(|error| {
+                            self.decode_error(format!("invalid streamed tool arguments: {error}"))
+                        })?;
+                        tool_calls.push(ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments,
+                        });
+                    }
+                    self.queue.push_back(Ok(LlmStreamEvent::ResponseCompleted {
+                        response: LlmResponse {
+                            content: (!self.content.is_empty()).then(|| self.content.clone()),
+                            tool_calls,
+                            usage: self.usage.clone(),
+                            finish_reason: self.finish.clone().unwrap_or(FinishReason::Stop),
+                            refusal: None,
+                            model: self.model.clone(),
+                            reported_model: self.reported_model.clone(),
+                        },
+                    }));
+                    self.done = true;
+                }
+                "error" => return Err(LlmError::Provider("anthropic stream error event".into())),
+                "ping" => {}
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    let state = State {
+        stream,
+        queue: VecDeque::new(),
+        model,
+        request_id,
+        metadata,
+        reported_model: None,
+        content: String::new(),
+        tools: BTreeMap::new(),
+        usage: TokenUsage::default(),
+        finish: None,
+        received_bytes: 0,
+        started: false,
+        stopped: false,
+        done: false,
+    };
+
+    Box::pin(stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.queue.pop_front() {
+                return Some((event, state));
+            }
+            if state.done {
+                return None;
+            }
+            match state.stream.next().await {
+                None => {
+                    state.done = true;
+                    return Some((
+                        Err(LlmError::IncompleteStream {
+                            received_bytes: state.received_bytes,
+                            finish_event_seen: state.stopped,
+                        }),
+                        state,
+                    ));
+                }
+                Some(Err(error)) => {
+                    state.done = true;
+                    let error = match error {
+                        eventsource_stream::EventStreamError::Transport(error) => error,
+                        eventsource_stream::EventStreamError::Utf8(error) => {
+                            state.decode_error(format!("stream is not valid UTF-8: {error}"))
+                        }
+                        eventsource_stream::EventStreamError::Parser(error) => {
+                            state.decode_error(format!("invalid event stream: {error}"))
+                        }
+                    };
+                    return Some((Err(error), state));
+                }
+                Some(Ok(event)) => {
+                    state.received_bytes += event.data.len();
+                    if event.data.trim().is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<serde_json::Value>(&event.data) {
+                        Ok(value) => {
+                            if let Err(error) = state.apply(&value) {
+                                state.done = true;
+                                return Some((Err(error), state));
+                            }
+                        }
+                        Err(error) => {
+                            state.done = true;
+                            let error = state.decode_error(format!(
+                                "failed to parse Anthropic SSE data: {error}"
+                            ));
+                            return Some((Err(error), state));
+                        }
+                    }
+                }
+            }
+        }
+    }))
+}
+
+fn parse_anthropic_finish_reason(reason: &str) -> FinishReason {
+    match reason {
+        "end_turn" | "stop_sequence" | "pause_turn" => FinishReason::Stop,
+        "tool_use" => FinishReason::ToolCalls,
+        "max_tokens" => FinishReason::Length,
+        "refusal" => FinishReason::ContentFilter,
+        other => FinishReason::Other(other.to_owned()),
+    }
+}
+
 #[allow(dead_code)]
-async fn collect_completed_response(
-    stream: LlmEventStream,
-) -> Result<LlmResponse, LlmError> {
+async fn collect_completed_response(stream: LlmEventStream) -> Result<LlmResponse, LlmError> {
     let mut stream = stream;
     while let Some(item) = stream.next().await {
         if let LlmStreamEvent::ResponseCompleted { response } = item? {
@@ -1959,6 +2340,9 @@ mod tests {
         net::TcpListener,
         task::JoinHandle,
     };
+
+    type TestResponse<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [u8]);
+    type OwnedTestResponse = (String, Vec<(String, String)>, Vec<u8>);
 
     async fn serve_once(
         status: &str,
@@ -2422,7 +2806,7 @@ mod tests {
         match error {
             LlmError::Decode {
                 body_len,
-                content_encoding,
+                content_encoding: _,
                 likely_truncated,
                 ..
             } => {
@@ -2513,7 +2897,7 @@ mod tests {
         match error {
             LlmError::Decode {
                 body_len,
-                content_encoding,
+                content_encoding: _,
                 cause,
                 likely_truncated,
                 ..
@@ -2537,6 +2921,7 @@ mod tests {
         .await;
         let adapter = GenericLlmAdapter::builder()
             .openai_base_url(base_url)
+            .max_retries(0)
             .build()
             .unwrap();
 
@@ -2551,7 +2936,7 @@ mod tests {
                 status: 429,
                 retry_after: Some(delay),
                 request_id,
-                body_metadata,
+                body_metadata: _,
             } => {
                 assert_eq!(delay, Duration::from_secs(12));
                 assert_eq!(request_id.as_deref(), Some("corr-1"));
@@ -2654,17 +3039,17 @@ mod tests {
 
     /// Server that responds to N sequential connections with the given
     /// (status, headers, body) triples, then panics.
-    async fn serve_multi(
-        responses: &[(&str, &[(&str, &str)], &[u8])],
-    ) -> (String, JoinHandle<Vec<usize>>) {
+    async fn serve_multi(responses: &[TestResponse<'_>]) -> (String, JoinHandle<Vec<usize>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let responses: Vec<(String, Vec<(String, String)>, Vec<u8>)> = responses
+        let responses: Vec<OwnedTestResponse> = responses
             .iter()
             .map(|(s, h, b)| {
                 (
                     s.to_string(),
-                    h.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect(),
+                    h.iter()
+                        .map(|(n, v)| (n.to_string(), v.to_string()))
+                        .collect(),
                     b.to_vec(),
                 )
             })
@@ -2739,11 +3124,7 @@ mod tests {
         }"#;
         let error_body = br#"{"error":{"message":"rate limited"}}"#;
         let (base_url, server) = serve_multi(&[
-            (
-                "429 Too Many Requests",
-                &[("retry-after", "0")],
-                error_body,
-            ),
+            ("429 Too Many Requests", &[("retry-after", "0")], error_body),
             ("200 OK", &[], success_body),
         ])
         .await;
@@ -2766,8 +3147,7 @@ mod tests {
     #[tokio::test]
     async fn no_retry_on_400() {
         let error_body = br#"{"error":{"message":"bad request"}}"#;
-        let (base_url, server) =
-            serve_multi(&[("400 Bad Request", &[], error_body)]).await;
+        let (base_url, server) = serve_multi(&[("400 Bad Request", &[], error_body)]).await;
         let adapter = GenericLlmAdapter::builder()
             .openai_base_url(base_url)
             .max_retries(3)
@@ -2788,7 +3168,6 @@ mod tests {
     async fn retry_exhausted_returns_last_error() {
         let error_body = br#"{"error":{"message":"still broken"}}"#;
         let (base_url, server) = serve_multi(&[
-            ("500 Internal Server Error", &[], error_body),
             ("500 Internal Server Error", &[], error_body),
             ("500 Internal Server Error", &[], error_body),
             ("500 Internal Server Error", &[], error_body),
@@ -3057,7 +3436,7 @@ mod tests {
         assert_eq!(tool_starts[0].0, 0);
         assert_eq!(tool_starts[0].1.as_deref(), Some("call_1"));
         assert_eq!(tool_starts[0].2.as_deref(), Some("search"));
-        assert_eq!(tool_args.len(), 3);
+        assert_eq!(tool_args.len(), 2);
         assert_eq!(tool_ends, vec![0]);
     }
 
@@ -3099,5 +3478,49 @@ mod tests {
 
         server.await.unwrap();
         assert_eq!(text, "compressed");
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_assembles_text_tools_usage_and_terminal_event() {
+        let data = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"lookup\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"rust\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":4}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let source = stream::iter([Ok::<Bytes, LlmError>(Bytes::from_static(data.as_bytes()))]);
+        let mut events = anthropic_event_stream(
+            source.eventsource(),
+            "claude-resolved".to_owned(),
+            Some("req-1".to_owned()),
+            ResponseBodyMetadata {
+                content_type: Some("text/event-stream".to_owned()),
+                content_encoding: None,
+                content_length: None,
+                request_id: Some("req-1".to_owned()),
+                body_len: 0,
+                body_hash: String::new(),
+                decoded_body_len: None,
+                decoded_body_hash: None,
+            },
+        );
+        let mut completed = None;
+        while let Some(event) = events.next().await {
+            if let LlmStreamEvent::ResponseCompleted { response } = event.unwrap() {
+                completed = Some(response);
+            }
+        }
+        let response = completed.expect("message_stop must complete the response");
+        assert_eq!(response.content.as_deref(), Some("hello"));
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"q": "rust"})
+        );
+        assert_eq!(response.usage.total_tokens, 7);
+        assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(response.reported_model.as_deref(), Some("claude-test"));
     }
 }
