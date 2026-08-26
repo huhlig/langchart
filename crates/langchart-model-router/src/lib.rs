@@ -27,7 +27,9 @@
 //! ```
 
 use async_trait::async_trait;
-use langchart_adapters::llm::{LlmAdapter, LlmError, LlmRequest, LlmResponse, ModelInfo};
+use langchart_adapters::llm::{
+    LlmAdapter, LlmError, LlmEventStream, LlmRequest, LlmResponse, ModelInfo,
+};
 use std::{collections::HashMap, sync::Arc};
 use tracing::debug;
 
@@ -178,6 +180,10 @@ impl LlmAdapter for ModelRouter {
         self.resolve(&request)?.complete(request).await
     }
 
+    async fn complete_stream(&self, request: LlmRequest) -> Result<LlmEventStream, LlmError> {
+        self.resolve(&request)?.complete_stream(request).await
+    }
+
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         // Aggregate models from all registered adapters.
         let mut all = Vec::new();
@@ -211,6 +217,7 @@ mod tests {
                 finish_reason: FinishReason::Stop,
                 refusal: None,
                 model: format!("fake/{}", req.model_policy.model.unwrap_or_default()),
+                reported_model: None,
             })
         }
     }
@@ -347,6 +354,7 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                     refusal: None,
                     model: "captured".into(),
+                    reported_model: None,
                 })
             }
         }

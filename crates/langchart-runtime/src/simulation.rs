@@ -61,6 +61,7 @@ impl LlmAdapter for NoopLlm {
             finish_reason: FinishReason::Stop,
             refusal: None,
             model: "simulation/noop".into(),
+            reported_model: None,
         })
     }
 }

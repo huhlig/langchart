@@ -295,6 +295,8 @@ impl WatsonxChatResponse {
             .ok_or_else(|| LlmError::Provider("watsonx returned no choices".to_owned()))?;
         let prompt_tokens = self.usage.prompt;
         let completion_tokens = self.usage.completion;
+        let resolved_model = self.model_id.clone();
+        let reported_model = self.model_version.unwrap_or(self.model_id);
         Ok(LlmResponse {
             content: Some(choice.message.content),
             tool_calls: Vec::new(),
@@ -308,7 +310,8 @@ impl WatsonxChatResponse {
             },
             finish_reason: map_finish_reason(choice.finish_reason.as_deref()),
             refusal: None,
-            model: self.model_version.unwrap_or(self.model_id),
+            model: resolved_model,
+            reported_model: Some(reported_model),
         })
     }
 }
@@ -572,7 +575,8 @@ mod tests {
         }))
         .unwrap();
         let response = response.into_llm_response().unwrap();
-        assert_eq!(response.model, "4.0.0");
+        assert_eq!(response.model, "ibm/granite-4-h-small");
+        assert_eq!(response.reported_model.as_deref(), Some("4.0.0"));
         assert_eq!(response.usage.total_tokens, 25);
         assert_eq!(response.finish_reason, FinishReason::Length);
     }

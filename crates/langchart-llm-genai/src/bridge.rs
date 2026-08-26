@@ -86,6 +86,7 @@ pub fn from_genai_response(resp: genai::chat::ChatResponse) -> LlmResponse {
         usage,
         finish_reason,
         refusal: None,
+        reported_model: Some(model.clone()),
         model,
     }
 }

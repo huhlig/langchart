@@ -1,8 +1,11 @@
 //! LLM adapter: abstract over model providers.
 
 use async_trait::async_trait;
+use futures::{stream, Stream};
 use langchart_model::policy::ModelPolicy;
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
+use std::time::Duration;
 
 /// A tool definition exposed to the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,8 +138,14 @@ pub struct LlmResponse {
     /// Provider refusal, separate from ordinary response content.
     #[serde(default)]
     pub refusal: Option<String>,
-    /// Raw model name returned by the provider.
+    /// Resolved model used for the request.
+    ///
+    /// This remains distinct from [`Self::reported_model`]: providers are not
+    /// required to echo a model name, and adapters must not invent one.
     pub model: String,
+    /// Raw model name returned by the provider, when one was reported.
+    #[serde(default)]
+    pub reported_model: Option<String>,
 }
 
 /// A model available from a provider.
@@ -146,8 +155,124 @@ pub struct ModelInfo {
     pub description: Option<String>,
 }
 
+/// Normalized incremental event stream returned by an LLM adapter.
+pub type LlmEventStream = Pin<Box<dyn Stream<Item = Result<LlmStreamEvent, LlmError>> + Send>>;
+
+/// Provider-independent events produced during one model generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LlmStreamEvent {
+    ResponseStarted {
+        request_id: Option<String>,
+        reported_model: Option<String>,
+    },
+    TextDelta {
+        delta: String,
+    },
+    ReasoningDelta {
+        delta: String,
+    },
+    ToolCallStart {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+    },
+    ToolCallArgumentsDelta {
+        index: usize,
+        delta: String,
+    },
+    ToolCallEnd {
+        index: usize,
+    },
+    RefusalDelta {
+        delta: String,
+    },
+    UsageUpdate {
+        usage: TokenUsage,
+    },
+    FinishReason {
+        reason: FinishReason,
+    },
+    /// The only event that carries a successful, durable response. All prior
+    /// deltas are provisional.
+    ResponseCompleted {
+        response: LlmResponse,
+    },
+}
+
+/// Expose an already-buffered response through the streaming contract.
+pub fn buffered_response_stream(response: LlmResponse) -> LlmEventStream {
+    let started = LlmStreamEvent::ResponseStarted {
+        request_id: None,
+        reported_model: response.reported_model.clone(),
+    };
+    Box::pin(stream::iter([
+        Ok(started),
+        Ok(LlmStreamEvent::ResponseCompleted { response }),
+    ]))
+}
+
+/// Stage at which an HTTP transport failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportStage {
+    Connect,
+    Send,
+    Headers,
+    Body,
+}
+
+/// Non-sensitive metadata captured for an HTTP response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseBodyMetadata {
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_length: Option<u64>,
+    pub request_id: Option<String>,
+    /// Number of encoded wire bytes captured by the adapter. For an oversized
+    /// or interrupted response this may be smaller than the complete body.
+    pub body_len: usize,
+    /// SHA-256 of the encoded wire bytes captured by the adapter.
+    pub body_hash: String,
+    /// Decoded body length, when content decoding completed successfully.
+    #[serde(default)]
+    pub decoded_body_len: Option<usize>,
+    /// SHA-256 of the decoded body, when content decoding completed successfully.
+    #[serde(default)]
+    pub decoded_body_hash: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
+    #[error("LLM transport failed during {stage:?}: {cause}")]
+    Transport {
+        stage: TransportStage,
+        retryable: bool,
+        cause: String,
+    },
+    #[error("LLM provider returned HTTP {status}")]
+    Http {
+        status: u16,
+        retry_after: Option<Duration>,
+        body_metadata: Box<ResponseBodyMetadata>,
+    },
+    #[error("failed to decode HTTP {status} response at {json_path:?}: {cause}")]
+    Decode {
+        status: u16,
+        body_metadata: Box<ResponseBodyMetadata>,
+        json_path: Option<String>,
+        line: Option<usize>,
+        column: Option<usize>,
+        cause: String,
+        likely_truncated: bool,
+    },
+    #[error(
+        "LLM stream ended before completion ({received_bytes} bytes, finish event seen: {finish_event_seen})"
+    )]
+    IncompleteStream {
+        received_bytes: usize,
+        finish_event_seen: bool,
+    },
     #[error("rate limited by provider: {0}")]
     RateLimited(String),
     #[error("model `{model}` not found")]
@@ -165,6 +290,25 @@ pub enum LlmError {
     Provider(String),
     #[error("request timed out")]
     Timeout,
+}
+
+/// Abstraction over a language model provider.
+#[async_trait]
+pub trait LlmAdapter: Send + Sync {
+    /// Perform one completion call.
+    async fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmError>;
+
+    /// Perform one completion call as normalized incremental events. Buffered
+    /// adapters inherit a two-event fallback; streaming adapters override it.
+    async fn complete_stream(&self, request: LlmRequest) -> Result<LlmEventStream, LlmError> {
+        Ok(buffered_response_stream(self.complete(request).await?))
+    }
+
+    /// List models available from a provider. Optional — returns an empty vec
+    /// if the provider does not support enumeration.
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+        Ok(vec![])
+    }
 }
 
 #[cfg(test)]
@@ -207,18 +351,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.refusal, None);
-    }
-}
-
-/// Abstraction over a language model provider.
-#[async_trait]
-pub trait LlmAdapter: Send + Sync {
-    /// Perform one completion call.
-    async fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmError>;
-
-    /// List models available from this provider. Optional — returns empty vec
-    /// if the provider does not support enumeration.
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        Ok(vec![])
+        assert_eq!(response.reported_model, None);
     }
 }
