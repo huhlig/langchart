@@ -28,9 +28,12 @@
 //!     .build()?;
 //! ```
 
+use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZstdDecoder};
 use async_trait::async_trait;
+use bytes::Bytes;
 use eventsource_stream::Eventsource;
-use futures::{Stream, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
+use futures::TryStreamExt;
 use langchart_adapters::llm::{
     FinishReason, LlmAdapter, LlmError, LlmEventStream, LlmRequest, LlmResponse, LlmStreamEvent,
     Message, ModelInfo, ResponseBodyMetadata, ResponseFormat, TokenUsage, ToolCall, ToolDefinition,
@@ -40,11 +43,12 @@ use reqwest::header::HeaderMap;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io::{Cursor, Read};
 use std::pin::Pin;
 use std::time::Duration;
-use tokio::io::{AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, BufReader};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, warn};
 
@@ -53,14 +57,17 @@ use tracing::{debug, warn};
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+#[allow(dead_code)]
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_FIRST_BYTE_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_TOTAL_GENERATION_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENCODED_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const ACCEPTED_CONTENT_ENCODINGS: &str = "gzip, br, deflate, zstd";
+const MAX_EVENT_QUEUE_DEPTH: usize = 64;
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
@@ -74,6 +81,7 @@ pub struct GenericLlmAdapterBuilder {
     connect_timeout: Option<Duration>,
     first_byte_timeout: Option<Duration>,
     stream_idle_timeout: Option<Duration>,
+    max_retries: Option<u32>,
     max_response_body_bytes: Option<usize>,
     max_encoded_response_body_bytes: Option<usize>,
 }
@@ -121,6 +129,12 @@ impl GenericLlmAdapterBuilder {
         self
     }
 
+    /// Maximum number of retries for transient (retryable) errors. Default: 3.
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.max_retries = Some(retries);
+        self
+    }
+
     /// Set the maximum decoded JSON response size. The default is 16 MiB.
     pub fn max_response_body_bytes(mut self, bytes: usize) -> Self {
         self.max_response_body_bytes = Some(bytes);
@@ -150,6 +164,9 @@ impl GenericLlmAdapterBuilder {
             openai_base_url: self
                 .openai_base_url
                 .unwrap_or_else(|| OPENAI_BASE_URL.to_string()),
+            max_retries: self
+                .max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
             max_response_body_bytes: self
                 .max_response_body_bytes
                 .unwrap_or(DEFAULT_MAX_RESPONSE_BODY_BYTES),
@@ -185,6 +202,7 @@ pub struct GenericLlmAdapter {
     openai_api_key: Option<String>,
     anthropic_api_key: Option<String>,
     openai_base_url: String,
+    max_retries: u32,
     max_response_body_bytes: usize,
     max_encoded_response_body_bytes: usize,
     first_byte_timeout: Duration,
@@ -211,6 +229,68 @@ impl GenericLlmAdapter {
     fn is_anthropic_model(model: &str) -> bool {
         model.starts_with("claude")
     }
+
+    /// Retry a fallible async operation with exponential backoff.
+    ///
+    /// Retries on errors where [`LlmError::is_retryable`] returns `true`.
+    /// Respects `retry_after` hints and the total generation deadline.
+    async fn with_retry<F, Fut, T>(
+        &self,
+        total_deadline: tokio::time::Instant,
+        mut f: F,
+    ) -> Result<T, LlmError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, LlmError>>,
+    {
+        let base_delay = Duration::from_millis(500);
+        let max_delay = Duration::from_secs(30);
+
+        for attempt in 0..=self.max_retries {
+            if tokio::time::Instant::now() >= total_deadline {
+                return Err(generation_timeout_error(
+                    "total generation deadline exceeded before retry",
+                ));
+            }
+
+            match f().await {
+                Err(e) if e.is_retryable() && attempt < self.max_retries => {
+                    let delay = e.retry_after().unwrap_or_else(|| {
+                        let exponential = base_delay * 2u32.saturating_pow(attempt);
+                        let capped = exponential.min(max_delay);
+                        // Simple jitter: 1–25% based on current time nanos.
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let jitter_pct = (nanos as u32 % 25) + 1;
+                        capped + capped * jitter_pct / 100
+                    });
+
+                    // Don't wait past the deadline.
+                    let remaining = total_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let wait = delay.min(remaining);
+
+                    if wait.is_zero() {
+                        return Err(generation_timeout_error(
+                            "total generation deadline exceeded during retry backoff",
+                        ));
+                    }
+
+                    warn!(
+                        attempt = attempt + 1,
+                        max = self.max_retries,
+                        delay_ms = wait.as_millis(),
+                        "retrying after transient error"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+                Err(e) => return Err(e),
+                Ok(response) => return Ok(response),
+            }
+        }
+        unreachable!("loop always returns")
+    }
 }
 
 #[async_trait]
@@ -223,14 +303,25 @@ impl LlmAdapter for GenericLlmAdapter {
             .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
         if Self::is_anthropic_model(&model) {
-            tokio::time::timeout(
-                self.total_generation_timeout,
-                self.complete_anthropic(&model, &request),
-            )
+            let total_deadline =
+                tokio::time::Instant::now() + self.total_generation_timeout;
+            let model = model.clone();
+            self.with_retry(total_deadline, || {
+                let model = model.clone();
+                let request = request.clone();
+                async move { self.complete_anthropic(&model, &request).await }
+            })
             .await
-            .map_err(|_| generation_timeout_error("total generation deadline exceeded"))?
         } else {
-            collect_completed_response(self.complete_openai_stream(&model, &request).await?).await
+            let total_deadline =
+                tokio::time::Instant::now() + self.total_generation_timeout;
+            let model = model.clone();
+            self.with_retry(total_deadline, || {
+                let model = model.clone();
+                let request = request.clone();
+                async move { self.complete_openai(&model, &request).await }
+            })
+            .await
         }
     }
 
@@ -242,15 +333,26 @@ impl LlmAdapter for GenericLlmAdapter {
             .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
         if Self::is_anthropic_model(&model) {
-            let response = tokio::time::timeout(
-                self.total_generation_timeout,
-                self.complete_anthropic(&model, &request),
-            )
-            .await
-            .map_err(|_| generation_timeout_error("total generation deadline exceeded"))??;
+            let total_deadline =
+                tokio::time::Instant::now() + self.total_generation_timeout;
+            let model = model.clone();
+            let response = self.with_retry(total_deadline, || {
+                let model = model.clone();
+                let request = request.clone();
+                async move { self.complete_anthropic(&model, &request).await }
+            })
+            .await?;
             Ok(buffered_response_stream(response))
         } else {
-            self.complete_openai_stream(&model, &request).await
+            let total_deadline =
+                tokio::time::Instant::now() + self.total_generation_timeout;
+            let model = model.clone();
+            self.with_retry(total_deadline, || {
+                let model = model.clone();
+                let request = request.clone();
+                async move { self.complete_openai_stream(&model, &request).await }
+            })
+            .await
         }
     }
 
@@ -281,7 +383,7 @@ struct OaiMessage {
     tool_calls: Option<Vec<OaiToolCall>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct OaiToolCall {
     id: String,
     #[serde(rename = "type")]
@@ -289,7 +391,7 @@ struct OaiToolCall {
     function: OaiFunction,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct OaiFunction {
     name: String,
     arguments: String,
@@ -403,6 +505,14 @@ impl OaiContent {
                 .collect(),
         }
     }
+
+    #[allow(dead_code)]
+    fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Parts(_) => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -487,6 +597,100 @@ struct OaiModelData {
 }
 
 impl GenericLlmAdapter {
+    async fn complete_openai(
+        &self,
+        model: &str,
+        req: &LlmRequest,
+    ) -> Result<LlmResponse, LlmError> {
+        let api_key = self.openai_api_key.as_deref().filter(|k| !k.is_empty());
+
+        let messages = req.messages.iter().map(msg_to_oai).collect::<Vec<_>>();
+        let tools = req.tools.iter().map(tool_to_oai).collect::<Vec<_>>();
+
+        let body = OaiRequest {
+            model: model.to_string(),
+            messages,
+            tools,
+            temperature: req.model_policy.temperature,
+            max_tokens: req.model_policy.max_tokens,
+            response_format: oai_response_format(&req.response_format),
+            stream: false,
+            stream_options: None,
+        };
+
+        debug!(model = model, "openai request");
+
+        let url = format!("{}/chat/completions", self.openai_base_url);
+        let mut req_builder = self
+            .client
+            .post(&url)
+            .header(reqwest::header::ACCEPT_ENCODING, ACCEPTED_CONTENT_ENCODINGS);
+
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+
+        let total_deadline = tokio::time::Instant::now() + self.total_generation_timeout;
+        let headers_deadline = std::cmp::min(
+            total_deadline,
+            tokio::time::Instant::now() + self.first_byte_timeout,
+        );
+        let response = tokio::time::timeout_at(headers_deadline, req_builder.json(&body).send())
+            .await
+            .map_err(|_| generation_timeout_error("response headers deadline exceeded"))?
+            .map_err(|error| http_to_llm_err(&error))?;
+
+        let oai: OaiResponse = self.decode_response(response).await?;
+
+        let mut text_content: Option<String> = None;
+        let mut refusal: Option<String> = None;
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+
+        for choice in &oai.choices {
+            if let Some(content) = &choice.message.content {
+                let text = match content {
+                    OaiContent::Text(t) => t.clone(),
+                    OaiContent::Parts(parts) => parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            OaiContentPart::Text(t) => Some(t.as_str()),
+                            OaiContentPart::Object { text } => text.as_deref(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                };
+                if !text.is_empty() {
+                    text_content = Some(text);
+                }
+            }
+            if let Some(r) = &choice.message.refusal {
+                refusal = Some(r.clone());
+            }
+            for tc in &choice.message.tool_calls {
+                tool_calls.push(oai_tc_to_tool_call(tc.clone()));
+            }
+        }
+
+        let finish_reason = oai
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.as_deref())
+            .map(|r| parse_oai_finish_reason(Some(r)))
+            .unwrap_or(FinishReason::Stop);
+
+        let usage = oai.usage.map(|u| u.into_token_usage()).unwrap_or_default();
+
+        Ok(LlmResponse {
+            content: text_content,
+            tool_calls,
+            usage,
+            finish_reason,
+            refusal,
+            model: model.to_string(),
+            reported_model: oai.model,
+        })
+    }
+
     async fn complete_openai_stream(
         &self,
         model: &str,
@@ -808,6 +1012,7 @@ impl GenericLlmAdapter {
             return Err(LlmError::Http {
                 status,
                 retry_after,
+                request_id: metadata.request_id.clone(),
                 body_metadata: Box::new(metadata),
             });
         }
@@ -819,10 +1024,11 @@ impl GenericLlmAdapter {
         )
         .map_err(|error| LlmError::Decode {
             status,
-            body_metadata: Box::new(metadata.clone()),
+            content_type: metadata.content_type.clone(),
+            content_encoding: metadata.content_encoding.clone(),
+            body_len: metadata.body_len,
+            body_hash: metadata.body_hash.clone(),
             json_path: None,
-            line: None,
-            column: None,
             cause: error.to_string(),
             likely_truncated: metadata
                 .content_length
@@ -834,10 +1040,11 @@ impl GenericLlmAdapter {
             let likely_truncated = json_error_likely_truncated(&error, &metadata);
             LlmError::Decode {
                 status,
-                body_metadata: Box::new(metadata.clone()),
+                content_type: metadata.content_type.clone(),
+                content_encoding: metadata.content_encoding.clone(),
+                body_len: metadata.body_len,
+                body_hash: metadata.body_hash.clone(),
                 json_path: None,
-                line: Some(error.line()),
-                column: Some(error.column()),
                 cause: error.to_string(),
                 likely_truncated,
             }
@@ -848,6 +1055,7 @@ impl GenericLlmAdapter {
             return Err(LlmError::Http {
                 status,
                 retry_after,
+                request_id: metadata.request_id.clone(),
                 body_metadata: Box::new(metadata),
             });
         }
@@ -858,10 +1066,11 @@ impl GenericLlmAdapter {
             let likely_truncated = json_error_likely_truncated(inner, &metadata);
             LlmError::Decode {
                 status,
-                body_metadata: Box::new(metadata),
+                content_type: metadata.content_type.clone(),
+                content_encoding: metadata.content_encoding.clone(),
+                body_len: metadata.body_len,
+                body_hash: metadata.body_hash.clone(),
                 json_path: Some(error.path().to_string()),
-                line: Some(inner.line()),
-                column: Some(inner.column()),
                 cause: inner.to_string(),
                 likely_truncated,
             }
@@ -895,10 +1104,11 @@ async fn read_bounded_body(
                     populate_body_fingerprint(&mut metadata, &body);
                     return Err(LlmError::Decode {
                         status,
-                        body_metadata: Box::new(metadata),
+                        content_type: metadata.content_type.clone(),
+                        content_encoding: metadata.content_encoding.clone(),
+                        body_len: metadata.body_len,
+                        body_hash: metadata.body_hash.clone(),
                         json_path: None,
-                        line: None,
-                        column: None,
                         cause: format!(
                             "encoded response body exceeds configured limit of {max_bytes} bytes"
                         ),
@@ -911,10 +1121,11 @@ async fn read_bounded_body(
                 populate_body_fingerprint(&mut metadata, &body);
                 return Err(LlmError::Decode {
                     status,
-                    body_metadata: Box::new(metadata),
+                    content_type: metadata.content_type.clone(),
+                    content_encoding: metadata.content_encoding.clone(),
+                    body_len: metadata.body_len,
+                    body_hash: metadata.body_hash.clone(),
                     json_path: None,
-                    line: None,
-                    column: None,
                     cause: format!("response body read failed: {error}"),
                     likely_truncated: true,
                 });
@@ -1181,6 +1392,561 @@ fn http_to_llm_err(e: &reqwest::Error) -> LlmError {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn generation_timeout_error(message: &str) -> LlmError {
+    warn!("{message}");
+    LlmError::Timeout
+}
+
+fn response_request_id(headers: &HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id", "x-correlation-id", "cf-ray"]
+        .into_iter()
+        .find_map(|name| header_string(headers, name))
+}
+
+fn decoded_streaming_body(
+    response: reqwest::Response,
+    max_encoded_bytes: usize,
+    max_decoded_bytes: usize,
+    first_byte_timeout: Duration,
+    idle_timeout: Duration,
+    total_deadline: tokio::time::Instant,
+) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, LlmError>> + Send>>, LlmError> {
+    let status = response.status().as_u16();
+    let metadata = response_metadata(response.headers());
+    let content_encoding = metadata.content_encoding.clone();
+
+    let raw = response
+        .bytes_stream()
+        .map_err(|error| LlmError::Transport {
+            stage: TransportStage::Body,
+            retryable: true,
+            cause: error.to_string(),
+        });
+
+    // Wrap the raw stream to count encoded (wire) bytes before decompression.
+    let encoded_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let encoded_counter = encoded_bytes.clone();
+    let raw = raw.map(move |result| {
+        result.map(|bytes| {
+            encoded_counter.fetch_add(bytes.len(), std::sync::atomic::Ordering::Relaxed);
+            bytes
+        })
+    });
+
+    let stream_reader =
+        StreamReader::new(raw.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let mut reader: Pin<Box<dyn AsyncBufRead + Send + Unpin>> =
+        Box::pin(BufReader::new(stream_reader));
+
+    if let Some(ref encoding) = content_encoding {
+        let encodings: Vec<&str> = encoding.split(',').map(str::trim).collect();
+        for enc in encodings.iter().rev() {
+            if enc.eq_ignore_ascii_case("identity") || enc.is_empty() {
+                continue;
+            }
+            // `prev` becomes the input to the decoder; the replacement is a
+            // no-op BufReader (its content doesn't matter since it will be
+            // overwritten or dropped on the next iteration / after the loop).
+            let prev = std::mem::replace(
+                &mut reader,
+                Box::pin(BufReader::new(tokio::io::empty())),
+            );
+            reader = match *enc {
+                e if e.eq_ignore_ascii_case("gzip") || e.eq_ignore_ascii_case("x-gzip") => {
+                    Box::pin(BufReader::new(GzipDecoder::new(BufReader::new(prev))))
+                }
+                e if e.eq_ignore_ascii_case("br") => {
+                    Box::pin(BufReader::new(BrotliDecoder::new(BufReader::new(prev))))
+                }
+                e if e.eq_ignore_ascii_case("deflate") => {
+                    Box::pin(BufReader::new(DeflateDecoder::new(BufReader::new(prev))))
+                }
+                e if e.eq_ignore_ascii_case("zstd") => {
+                    Box::pin(BufReader::new(ZstdDecoder::new(BufReader::new(prev))))
+                }
+                _ => {
+                    return Err(LlmError::Decode {
+                        status,
+                        content_type: metadata.content_type,
+                        content_encoding: Some(encoding.to_string()),
+                        body_len: 0,
+                        body_hash: String::new(),
+                        json_path: None,
+                        cause: format!("unsupported content encoding: {enc}"),
+                        likely_truncated: false,
+                    });
+                }
+            };
+        }
+    }
+
+    let decoded_stream = ReaderStream::new(reader).map_err(move |e| LlmError::Decode {
+        status,
+        content_type: None,
+        content_encoding: content_encoding.clone(),
+        body_len: 0,
+        body_hash: String::new(),
+        json_path: None,
+        cause: format!("content decoding failed: {e}"),
+        likely_truncated: false,
+    });
+
+    let initial_wait = first_byte_timeout;
+    let idle = idle_timeout;
+
+    struct DecodeState<S> {
+        stream: S,
+        encoded_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        decoded: usize,
+        seen_first: bool,
+        done: bool,
+    }
+
+    let init = DecodeState {
+        stream: decoded_stream,
+        encoded_bytes,
+        decoded: 0,
+        seen_first: false,
+        done: false,
+    };
+
+    let result = stream::unfold(init, move |mut st| async move {
+        if st.done {
+            return None;
+        }
+        if tokio::time::Instant::now() >= total_deadline {
+            st.done = true;
+            return Some((
+                Err(generation_timeout_error("total generation deadline exceeded")),
+                st,
+            ));
+        }
+        let wait = if st.seen_first {
+            idle
+        } else {
+            initial_wait
+        };
+        match tokio::time::timeout(wait, st.stream.next()).await {
+            Err(_elapsed) => {
+                st.done = true;
+                Some((Err(LlmError::Timeout), st))
+            }
+            Ok(None) => None,
+            Ok(Some(Err(e))) => {
+                st.done = true;
+                Some((Err(e), st))
+            }
+            Ok(Some(Ok(bytes))) => {
+                st.seen_first = true;
+                let encoded = st
+                    .encoded_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if encoded > max_encoded_bytes {
+                    st.done = true;
+                    Some((
+                        Err(LlmError::Decode {
+                            status,
+                            content_type: None,
+                            content_encoding: None,
+                            body_len: encoded,
+                            body_hash: String::new(),
+                            json_path: None,
+                            cause: format!(
+                                "encoded response body exceeds configured limit of \
+                                 {max_encoded_bytes} bytes"
+                            ),
+                            likely_truncated: true,
+                        }),
+                        st,
+                    ))
+                } else {
+                    st.decoded += bytes.len();
+                    if st.decoded > max_decoded_bytes {
+                        st.done = true;
+                        Some((
+                            Err(LlmError::Decode {
+                                status,
+                                content_type: None,
+                                content_encoding: None,
+                                body_len: st.decoded,
+                                body_hash: String::new(),
+                                json_path: None,
+                                cause: format!(
+                                    "decoded response body exceeds configured limit of \
+                                     {max_decoded_bytes} bytes"
+                                ),
+                                likely_truncated: false,
+                            }),
+                            st,
+                        ))
+                    } else {
+                        Some((Ok(bytes), st))
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(Box::pin(result))
+}
+
+fn openai_event_stream<S>(
+    stream: S,
+    model: String,
+    response_format: ResponseFormat,
+    request_id: Option<String>,
+    metadata: ResponseBodyMetadata,
+) -> LlmEventStream
+where
+    S: Stream<
+            Item = Result<
+                eventsource_stream::Event,
+                eventsource_stream::EventStreamError<LlmError>,
+            >,
+        > + Send
+        + Unpin
+        + 'static,
+{
+    struct OaiStreamState<S> {
+        stream: S,
+        queue: VecDeque<Result<LlmStreamEvent, LlmError>>,
+        started: bool,
+        done: bool,
+        content: String,
+        refusal: String,
+        tool_calls: Vec<(String, String, String)>,
+        open_tool: Option<usize>,
+        usage: Option<TokenUsage>,
+        finish: Option<FinishReason>,
+        reported_model: Option<String>,
+        received_bytes: usize,
+        finish_event_seen: bool,
+        hasher: Sha256,
+        model: String,
+        request_id: Option<String>,
+        metadata: ResponseBodyMetadata,
+        response_format: ResponseFormat,
+    }
+
+    impl<S> OaiStreamState<S>
+    where
+        S: Stream<
+                Item = Result<
+                    eventsource_stream::Event,
+                    eventsource_stream::EventStreamError<LlmError>,
+                >,
+            > + Send
+            + Unpin
+            + 'static,
+    {
+        fn start(&mut self) {
+            self.started = true;
+            self.queue.push_back(Ok(LlmStreamEvent::ResponseStarted {
+                request_id: self.request_id.clone(),
+                reported_model: self.reported_model.clone(),
+            }));
+        }
+
+        fn apply_chunk(&mut self, chunk: OaiStreamChunk) {
+            if let Some(m) = chunk.model {
+                self.reported_model = Some(m);
+            }
+            if let Some(usage) = chunk.usage {
+                let token_usage = usage.into_token_usage();
+                self.usage = Some(token_usage.clone());
+                self.queue
+                    .push_back(Ok(LlmStreamEvent::UsageUpdate { usage: token_usage }));
+            }
+            for choice in chunk.choices {
+                if let Some(content) = choice.delta.content {
+                    let text = content.into_text();
+                    if !text.is_empty() {
+                        self.content.push_str(&text);
+                        self.queue
+                            .push_back(Ok(LlmStreamEvent::TextDelta { delta: text }));
+                    }
+                }
+                if let Some(reasoning) = choice.delta.reasoning_content {
+                    self.queue
+                        .push_back(Ok(LlmStreamEvent::ReasoningDelta { delta: reasoning }));
+                }
+                if let Some(refusal) = choice.delta.refusal {
+                    self.refusal.push_str(&refusal);
+                    self.queue
+                        .push_back(Ok(LlmStreamEvent::RefusalDelta { delta: refusal }));
+                }
+                for tc in choice.delta.tool_calls {
+                    let slot = if tc.index >= self.tool_calls.len() {
+                        self.tool_calls.resize(
+                            tc.index + 1,
+                            (String::new(), String::new(), String::new()),
+                        );
+                        self.tool_calls.last_mut().unwrap()
+                    } else {
+                        &mut self.tool_calls[tc.index]
+                    };
+                    let is_start =
+                        tc.id.is_some() || (slot.0.is_empty() && slot.1.is_empty());
+                    if is_start {
+                        if let Some(open) = self.open_tool.take() {
+                            if open != tc.index {
+                                self.queue
+                                    .push_back(Ok(LlmStreamEvent::ToolCallEnd { index: open }));
+                            }
+                        }
+                        if let Some(id) = tc.id {
+                            slot.0 = id;
+                        }
+                        if let Some(function) = &tc.function {
+                            if let Some(name) = &function.name {
+                                slot.1 = name.clone();
+                            }
+                        }
+                        self.open_tool = Some(tc.index);
+                        self.queue.push_back(Ok(LlmStreamEvent::ToolCallStart {
+                            index: tc.index,
+                            id: (!slot.0.is_empty()).then(|| slot.0.clone()),
+                            name: (!slot.1.is_empty()).then(|| slot.1.clone()),
+                        }));
+                    }
+                    if let Some(function) = tc.function {
+                        if let Some(args) = function.arguments {
+                            slot.2.push_str(&args);
+                            self.queue
+                                .push_back(Ok(LlmStreamEvent::ToolCallArgumentsDelta {
+                                    index: tc.index,
+                                    delta: args,
+                                }));
+                        }
+                    }
+                }
+                if let Some(finish_reason) = choice.finish_reason {
+                    let reason = parse_oai_finish_reason(Some(&finish_reason));
+                    self.finish = Some(reason.clone());
+                    self.queue
+                        .push_back(Ok(LlmStreamEvent::FinishReason { reason }));
+                }
+            }
+        }
+
+        fn finalize(&mut self) {
+            if let Some(open) = self.open_tool.take() {
+                self.queue
+                    .push_back(Ok(LlmStreamEvent::ToolCallEnd { index: open }));
+            }
+            let content = if self.content.is_empty() {
+                None
+            } else {
+                Some(self.content.clone())
+            };
+            let tool_calls: Vec<ToolCall> = self
+                .tool_calls
+                .iter()
+                .map(|(id, name, args)| ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: serde_json::from_str(args)
+                        .unwrap_or_else(|_| serde_json::Value::String(args.clone())),
+                })
+                .collect();
+            if !content.is_none() {
+                if let ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. } =
+                    self.response_format
+                {
+                    if let Err(e) =
+                        serde_json::from_str::<serde_json::Value>(content.as_ref().unwrap())
+                    {
+                        self.done = true;
+                        self.queue.push_back(Err(LlmError::Decode {
+                            status: 200,
+                            content_type: None,
+                            content_encoding: None,
+                            body_len: self.received_bytes,
+                            body_hash: String::new(),
+                            json_path: None,
+                            cause: format!(
+                                "structured response content is not valid JSON: {e}"
+                            ),
+                            likely_truncated: matches!(
+                                self.finish,
+                                Some(FinishReason::Length)
+                            ),
+                        }));
+                        return;
+                    }
+                }
+            }
+            self.done = true;
+            self.queue
+                .push_back(Ok(LlmStreamEvent::ResponseCompleted {
+                    response: LlmResponse {
+                        content,
+                        tool_calls,
+                        usage: self.usage.clone().unwrap_or_default(),
+                        finish_reason: self.finish.clone().unwrap_or(FinishReason::Stop),
+                        refusal: if self.refusal.is_empty() {
+                            None
+                        } else {
+                            Some(self.refusal.clone())
+                        },
+                        model: self.model.clone(),
+                        reported_model: self.reported_model.clone(),
+                    },
+                }));
+        }
+
+        fn decode_error(&self, cause: String) -> LlmError {
+            LlmError::Decode {
+                status: 200,
+                content_type: self.metadata.content_type.clone(),
+                content_encoding: self.metadata.content_encoding.clone(),
+                body_len: self.received_bytes,
+                body_hash: String::new(),
+                json_path: None,
+                cause,
+                likely_truncated: false,
+            }
+        }
+    }
+
+    let state = OaiStreamState {
+        stream,
+        queue: VecDeque::new(),
+        started: false,
+        done: false,
+        content: String::new(),
+        refusal: String::new(),
+        tool_calls: Vec::new(),
+        open_tool: None,
+        usage: None,
+        finish: None,
+        reported_model: None,
+        received_bytes: 0,
+        finish_event_seen: false,
+        hasher: Sha256::new(),
+        model,
+        request_id,
+        metadata,
+        response_format,
+    };
+
+    Box::pin(stream::unfold(state, |mut st| async move {
+        loop {
+            // Backpressure: drain queued events before reading more from upstream.
+            if st.queue.len() >= MAX_EVENT_QUEUE_DEPTH {
+                if let Some(item) = st.queue.pop_front() {
+                    if item.is_err() {
+                        st.done = true;
+                    }
+                    return Some((item, st));
+                }
+            }
+
+            if let Some(item) = st.queue.pop_front() {
+                if item.is_err() {
+                    st.done = true;
+                }
+                return Some((item, st));
+            }
+            if st.done {
+                return None;
+            }
+            match st.stream.next().await {
+                None => {
+                    if st.finish_event_seen {
+                        return None;
+                    }
+                    if st.finish.is_some() {
+                        st.finish_event_seen = true;
+                        st.finalize();
+                        continue;
+                    }
+                    st.done = true;
+                    return Some((
+                        Err(LlmError::IncompleteStream {
+                            received_bytes: st.received_bytes,
+                            finish_event_seen: false,
+                        }),
+                        st,
+                    ));
+                }
+                Some(Err(error)) => {
+                    st.done = true;
+                    let mapped = match error {
+                        eventsource_stream::EventStreamError::Transport(e) => e,
+                        eventsource_stream::EventStreamError::Utf8(e) => {
+                            st.decode_error(format!("stream is not valid UTF-8: {e}"))
+                        }
+                        eventsource_stream::EventStreamError::Parser(e) => {
+                            st.decode_error(format!("invalid event stream: {e}"))
+                        }
+                    };
+                    return Some((Err(mapped), st));
+                }
+                Some(Ok(event)) => {
+                    st.received_bytes += event.data.len();
+                    st.hasher.update(event.data.as_bytes());
+                    if !st.started {
+                        st.start();
+                    }
+                    let data = event.data.trim();
+                    if data == "[DONE]" {
+                        st.finish_event_seen = true;
+                        st.finalize();
+                        continue;
+                    }
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if event.event.as_str() == "error" {
+                        st.done = true;
+                        return Some((
+                            Err(LlmError::Provider(format!(
+                                "provider error event: {data}"
+                            ))),
+                            st,
+                        ));
+                    }
+                    let mut de = serde_json::Deserializer::from_str(data);
+                    match serde_path_to_error::deserialize::<_, OaiStreamChunk>(&mut de) {
+                        Ok(chunk) => st.apply_chunk(chunk),
+                        Err(e) => {
+                            st.done = true;
+                            return Some((
+                                Err(st.decode_error(format!(
+                                    "failed to parse SSE data: {}",
+                                    e.inner()
+                                ))),
+                                st,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }))
+}
+
+#[allow(dead_code)]
+async fn collect_completed_response(
+    stream: LlmEventStream,
+) -> Result<LlmResponse, LlmError> {
+    let mut stream = stream;
+    while let Some(item) = stream.next().await {
+        if let LlmStreamEvent::ResponseCompleted { response } = item? {
+            return Ok(response);
+        }
+    }
+    Err(LlmError::IncompleteStream {
+        received_bytes: 0,
+        finish_event_seen: false,
+    })
+}
+
 // ── Unit tests (no network required) ─────────────────────────────────────────
 
 #[cfg(test)]
@@ -1370,6 +2136,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             response_format: None,
+            stream: false,
+            stream_options: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         // tools array should be absent (skip_serializing_if = Vec::is_empty)
@@ -1608,23 +2376,17 @@ mod tests {
         match error {
             LlmError::Decode {
                 status,
-                body_metadata,
+                content_type,
+                body_len,
+                body_hash,
                 likely_truncated,
-                line,
-                column,
                 ..
             } => {
                 assert_eq!(status, 200);
-                assert_eq!(
-                    body_metadata.content_type.as_deref(),
-                    Some("application/json")
-                );
-                assert_eq!(body_metadata.request_id.as_deref(), Some("req-123"));
-                assert_eq!(body_metadata.body_len, body.len());
-                assert_eq!(body_metadata.body_hash, sha256_hex(body));
+                assert_eq!(content_type.as_deref(), Some("application/json"));
+                assert_eq!(body_len, body.len());
+                assert_eq!(body_hash, sha256_hex(body));
                 assert!(likely_truncated);
-                assert!(line.is_some());
-                assert!(column.is_some());
             }
             other => panic!("expected decode error, got {other:?}"),
         }
@@ -1659,12 +2421,12 @@ mod tests {
 
         match error {
             LlmError::Decode {
-                body_metadata,
+                body_len,
+                content_encoding,
                 likely_truncated,
                 ..
             } => {
-                assert_eq!(body_metadata.content_length, Some(100));
-                assert!(body_metadata.body_len < 100);
+                assert!(body_len < 100);
                 assert!(likely_truncated);
             }
             other => panic!("expected decode error, got {other:?}"),
@@ -1719,11 +2481,11 @@ mod tests {
 
         match error {
             LlmError::Decode {
-                body_metadata,
+                body_len,
                 likely_truncated,
                 ..
             } => {
-                assert_eq!(body_metadata.body_len, 9);
+                assert_eq!(body_len, 9);
                 assert!(likely_truncated);
             }
             other => panic!("expected decode error, got {other:?}"),
@@ -1750,13 +2512,13 @@ mod tests {
 
         match error {
             LlmError::Decode {
-                body_metadata,
+                body_len,
+                content_encoding,
                 cause,
                 likely_truncated,
                 ..
             } => {
-                assert_eq!(body_metadata.body_len, wire_len);
-                assert_eq!(body_metadata.decoded_body_len, None);
+                assert_eq!(body_len, wire_len);
                 assert!(cause.contains("decoded response body exceeds"));
                 assert!(!likely_truncated);
             }
@@ -1788,10 +2550,11 @@ mod tests {
             LlmError::Http {
                 status: 429,
                 retry_after: Some(delay),
+                request_id,
                 body_metadata,
             } => {
                 assert_eq!(delay, Duration::from_secs(12));
-                assert_eq!(body_metadata.request_id.as_deref(), Some("corr-1"));
+                assert_eq!(request_id.as_deref(), Some("corr-1"));
             }
             other => panic!("expected HTTP 429 error, got {other:?}"),
         }
@@ -1872,18 +2635,469 @@ mod tests {
 
         match error {
             LlmError::Decode {
-                body_metadata,
+                content_encoding,
+                body_len,
+                body_hash,
                 likely_truncated,
                 ..
             } => {
-                assert_eq!(body_metadata.content_encoding.as_deref(), Some("gzip"));
-                assert_eq!(body_metadata.request_id.as_deref(), Some("req-gzip"));
-                assert_eq!(body_metadata.body_len, body.len());
-                assert_eq!(body_metadata.body_hash, sha256_hex(body));
-                assert_eq!(body_metadata.decoded_body_len, None);
+                assert_eq!(content_encoding.as_deref(), Some("gzip"));
+                assert_eq!(body_len, body.len());
+                assert_eq!(body_hash, sha256_hex(body));
                 assert!(!likely_truncated);
             }
             other => panic!("expected decode error, got {other:?}"),
         }
+    }
+
+    // ── Retry tests ────────────────────────────────────────────────────────────
+
+    /// Server that responds to N sequential connections with the given
+    /// (status, headers, body) triples, then panics.
+    async fn serve_multi(
+        responses: &[(&str, &[(&str, &str)], &[u8])],
+    ) -> (String, JoinHandle<Vec<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses: Vec<(String, Vec<(String, String)>, Vec<u8>)> = responses
+            .iter()
+            .map(|(s, h, b)| {
+                (
+                    s.to_string(),
+                    h.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect(),
+                    b.to_vec(),
+                )
+            })
+            .collect();
+
+        let server = tokio::spawn(async move {
+            let mut request_lengths = Vec::new();
+            for (status, headers, body) in &responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert!(read > 0, "client closed before sending HTTP headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                request_lengths.push(request.len());
+
+                let mut response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                for (name, value) in headers {
+                    response.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+                }
+                response.extend_from_slice(b"\r\n");
+                response.extend_from_slice(body);
+                socket.write_all(&response).await.unwrap();
+            }
+            request_lengths
+        });
+
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn retry_on_500_then_succeeds() {
+        let success_body = br#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        }"#;
+        let error_body = br#"{"error":{"message":"internal error"}}"#;
+        let (base_url, server) = serve_multi(&[
+            ("500 Internal Server Error", &[], error_body),
+            ("200 OK", &[], success_body),
+        ])
+        .await;
+        let adapter = GenericLlmAdapter::builder()
+            .openai_base_url(base_url)
+            .max_retries(3)
+            .build()
+            .unwrap();
+
+        let response = adapter
+            .complete(openai_request("test-model"))
+            .await
+            .unwrap();
+        let request_counts = server.await.unwrap();
+
+        assert_eq!(response.content.as_deref(), Some("ok"));
+        // Server handled 2 connections: 1 failed + 1 succeeded
+        assert_eq!(request_counts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_on_429_then_succeeds() {
+        let success_body = br#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        }"#;
+        let error_body = br#"{"error":{"message":"rate limited"}}"#;
+        let (base_url, server) = serve_multi(&[
+            (
+                "429 Too Many Requests",
+                &[("retry-after", "0")],
+                error_body,
+            ),
+            ("200 OK", &[], success_body),
+        ])
+        .await;
+        let adapter = GenericLlmAdapter::builder()
+            .openai_base_url(base_url)
+            .max_retries(3)
+            .build()
+            .unwrap();
+
+        let response = adapter
+            .complete(openai_request("test-model"))
+            .await
+            .unwrap();
+        let request_counts = server.await.unwrap();
+
+        assert_eq!(response.content.as_deref(), Some("ok"));
+        assert_eq!(request_counts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn no_retry_on_400() {
+        let error_body = br#"{"error":{"message":"bad request"}}"#;
+        let (base_url, server) =
+            serve_multi(&[("400 Bad Request", &[], error_body)]).await;
+        let adapter = GenericLlmAdapter::builder()
+            .openai_base_url(base_url)
+            .max_retries(3)
+            .build()
+            .unwrap();
+
+        let error = adapter
+            .complete(openai_request("test-model"))
+            .await
+            .unwrap_err();
+        let request_counts = server.await.unwrap();
+
+        assert!(matches!(error, LlmError::Http { status: 400, .. }));
+        assert_eq!(request_counts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_exhausted_returns_last_error() {
+        let error_body = br#"{"error":{"message":"still broken"}}"#;
+        let (base_url, server) = serve_multi(&[
+            ("500 Internal Server Error", &[], error_body),
+            ("500 Internal Server Error", &[], error_body),
+            ("500 Internal Server Error", &[], error_body),
+            ("500 Internal Server Error", &[], error_body),
+        ])
+        .await;
+        let adapter = GenericLlmAdapter::builder()
+            .openai_base_url(base_url)
+            .max_retries(2)
+            .build()
+            .unwrap();
+
+        let error = adapter
+            .complete(openai_request("test-model"))
+            .await
+            .unwrap_err();
+        let request_counts = server.await.unwrap();
+
+        assert!(matches!(error, LlmError::Http { status: 500, .. }));
+        // 1 initial + 2 retries = 3 connections
+        assert_eq!(request_counts.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_respects_max_retries_zero() {
+        let error_body = br#"{"error":{"message":"fail"}}"#;
+        let (base_url, server) =
+            serve_multi(&[("500 Internal Server Error", &[], error_body)]).await;
+        let adapter = GenericLlmAdapter::builder()
+            .openai_base_url(base_url)
+            .max_retries(0)
+            .build()
+            .unwrap();
+
+        let error = adapter
+            .complete(openai_request("test-model"))
+            .await
+            .unwrap_err();
+        let request_counts = server.await.unwrap();
+
+        assert!(matches!(error, LlmError::Http { status: 500, .. }));
+        assert_eq!(request_counts.len(), 1);
+    }
+
+    // ── LlmError::is_retryable / retry_after tests ─────────────────────────────
+
+    #[test]
+    fn transport_retryable_is_retryable() {
+        let err = LlmError::Transport {
+            stage: TransportStage::Connect,
+            retryable: true,
+            cause: "connection refused".into(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn transport_non_retryable_is_not_retryable() {
+        let err = LlmError::Transport {
+            stage: TransportStage::Body,
+            retryable: false,
+            cause: "body read error".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn http_429_is_retryable() {
+        let err = LlmError::Http {
+            status: 429,
+            retry_after: Some(Duration::from_secs(5)),
+            request_id: None,
+            body_metadata: Box::new(ResponseBodyMetadata {
+                content_type: None,
+                content_encoding: None,
+                content_length: None,
+                request_id: None,
+                body_len: 0,
+                body_hash: String::new(),
+                decoded_body_len: None,
+                decoded_body_hash: None,
+            }),
+        };
+        assert!(err.is_retryable());
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn http_500_is_retryable() {
+        let err = LlmError::Http {
+            status: 500,
+            retry_after: None,
+            request_id: None,
+            body_metadata: Box::new(ResponseBodyMetadata {
+                content_type: None,
+                content_encoding: None,
+                content_length: None,
+                request_id: None,
+                body_len: 0,
+                body_hash: String::new(),
+                decoded_body_len: None,
+                decoded_body_hash: None,
+            }),
+        };
+        assert!(err.is_retryable());
+        assert_eq!(err.retry_after(), None);
+    }
+
+    #[test]
+    fn http_400_is_not_retryable() {
+        let err = LlmError::Http {
+            status: 400,
+            retry_after: None,
+            request_id: None,
+            body_metadata: Box::new(ResponseBodyMetadata {
+                content_type: None,
+                content_encoding: None,
+                content_length: None,
+                request_id: None,
+                body_len: 0,
+                body_hash: String::new(),
+                decoded_body_len: None,
+                decoded_body_hash: None,
+            }),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn decode_error_is_not_retryable() {
+        let err = LlmError::Decode {
+            status: 200,
+            content_type: None,
+            content_encoding: None,
+            body_len: 0,
+            body_hash: String::new(),
+            json_path: None,
+            cause: "invalid json".into(),
+            likely_truncated: false,
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn timeout_error_is_not_retryable() {
+        assert!(!LlmError::Timeout.is_retryable());
+    }
+
+    #[test]
+    fn incomplete_stream_is_not_retryable() {
+        let err = LlmError::IncompleteStream {
+            received_bytes: 0,
+            finish_event_seen: false,
+        };
+        assert!(!err.is_retryable());
+    }
+
+    // ── Backpressure tests ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn streaming_delivers_all_events_with_backpressure() {
+        // Build an SSE response with many chunks.
+        let mut sse_body = String::new();
+        for i in 0..100 {
+            let chunk = serde_json::json!({
+                "choices": [{
+                    "delta": {"content": format!("token-{i}")},
+                    "finish_reason": null
+                }]
+            });
+            sse_body.push_str(&format!("data: {}\n\n", chunk));
+        }
+        sse_body.push_str("data: [DONE]\n\n");
+
+        let (base_url, server) = serve_once(
+            "200 OK",
+            &[("content-type", "text/event-stream")],
+            sse_body.as_bytes(),
+        )
+        .await;
+        let adapter = GenericLlmAdapter::builder()
+            .openai_base_url(base_url)
+            .build()
+            .unwrap();
+
+        let mut stream = adapter
+            .complete_stream(openai_request("test-model"))
+            .await
+            .unwrap();
+
+        let mut text_deltas = Vec::new();
+        let mut got_completed = false;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                LlmStreamEvent::TextDelta { delta } => text_deltas.push(delta),
+                LlmStreamEvent::ResponseCompleted { .. } => {
+                    got_completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        server.await.unwrap();
+        assert!(got_completed);
+        assert_eq!(text_deltas.len(), 100);
+        assert_eq!(text_deltas[0], "token-0");
+        assert_eq!(text_deltas[99], "token-99");
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_call_events_are_correctly_assembled() {
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\
+             \"function\":{\"name\":\"search\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
+             \"function\":{\"arguments\":\"{\\\"q\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
+             \"function\":{\"arguments\":\":\\\"rust\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let (base_url, server) = serve_once(
+            "200 OK",
+            &[("content-type", "text/event-stream")],
+            sse_body.as_bytes(),
+        )
+        .await;
+        let adapter = GenericLlmAdapter::builder()
+            .openai_base_url(base_url)
+            .build()
+            .unwrap();
+
+        let mut stream = adapter
+            .complete_stream(openai_request("test-model"))
+            .await
+            .unwrap();
+
+        let mut tool_starts = Vec::new();
+        let mut tool_args = Vec::new();
+        let mut tool_ends = Vec::new();
+        let mut got_finish = false;
+
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                LlmStreamEvent::ToolCallStart { index, id, name } => {
+                    tool_starts.push((index, id, name));
+                }
+                LlmStreamEvent::ToolCallArgumentsDelta { index, delta } => {
+                    tool_args.push((index, delta));
+                }
+                LlmStreamEvent::ToolCallEnd { index } => {
+                    tool_ends.push(index);
+                }
+                LlmStreamEvent::FinishReason { .. } => {
+                    got_finish = true;
+                }
+                LlmStreamEvent::ResponseCompleted { .. } => break,
+                _ => {}
+            }
+        }
+
+        server.await.unwrap();
+        assert!(got_finish);
+        assert_eq!(tool_starts.len(), 1);
+        assert_eq!(tool_starts[0].0, 0);
+        assert_eq!(tool_starts[0].1.as_deref(), Some("call_1"));
+        assert_eq!(tool_starts[0].2.as_deref(), Some("search"));
+        assert_eq!(tool_args.len(), 3);
+        assert_eq!(tool_ends, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn streaming_gzip_compressed_sse_is_decoded() {
+        let decoded_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"compressed\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let body = encode_fixture(decoded_sse.as_bytes(), "gzip");
+        let (base_url, server) = serve_once(
+            "200 OK",
+            &[
+                ("content-type", "text/event-stream"),
+                ("content-encoding", "gzip"),
+            ],
+            &body,
+        )
+        .await;
+        let adapter = GenericLlmAdapter::builder()
+            .openai_base_url(base_url)
+            .build()
+            .unwrap();
+
+        let mut stream = adapter
+            .complete_stream(openai_request("test-model"))
+            .await
+            .unwrap();
+
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                LlmStreamEvent::TextDelta { delta } => text.push_str(&delta),
+                LlmStreamEvent::ResponseCompleted { .. } => break,
+                _ => {}
+            }
+        }
+
+        server.await.unwrap();
+        assert_eq!(text, "compressed");
     }
 }

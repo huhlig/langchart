@@ -254,15 +254,19 @@ pub enum LlmError {
     Http {
         status: u16,
         retry_after: Option<Duration>,
+        request_id: Option<String>,
         body_metadata: Box<ResponseBodyMetadata>,
     },
-    #[error("failed to decode HTTP {status} response at {json_path:?}: {cause}")]
+    #[error(
+        "failed to decode HTTP {status} response: content_type={content_type:?}, content_encoding={content_encoding:?}, body_len={body_len}, body_hash={body_hash}..., json_path={json_path:?}: {cause}"
+    )]
     Decode {
         status: u16,
-        body_metadata: Box<ResponseBodyMetadata>,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        body_len: usize,
+        body_hash: String,
         json_path: Option<String>,
-        line: Option<usize>,
-        column: Option<usize>,
         cause: String,
         likely_truncated: bool,
     },
@@ -290,6 +294,25 @@ pub enum LlmError {
     Provider(String),
     #[error("request timed out")]
     Timeout,
+}
+
+impl LlmError {
+    /// Returns `true` if the error is likely transient and a retry may succeed.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport { retryable, .. } => *retryable,
+            Self::Http { status, .. } => *status == 429 || (500..600).contains(status),
+            _ => false,
+        }
+    }
+
+    /// Suggested wait duration before a retry, if the provider indicated one.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 /// Abstraction over a language model provider.
