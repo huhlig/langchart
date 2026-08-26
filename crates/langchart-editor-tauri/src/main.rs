@@ -7,8 +7,8 @@
 
 use std::fs;
 use std::path::PathBuf;
-use tauri::Manager;
 use tauri::Emitter;
+use tauri::Manager;
 
 // ── File I/O commands ─────────────────────────────────────────────────────────
 
@@ -58,7 +58,10 @@ async fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<FilePayload>, 
 
 /// Show a native save file dialog and write the content.
 #[tauri::command]
-async fn save_file_dialog(app: tauri::AppHandle, content: String) -> Result<Option<String>, String> {
+async fn save_file_dialog(
+    app: tauri::AppHandle,
+    content: String,
+) -> Result<Option<String>, String> {
     use rfd::FileDialog;
 
     let dialog = FileDialog::new()
@@ -87,11 +90,7 @@ fn get_current_file_path(app: tauri::AppHandle) -> Result<Option<String>, String
     let state = app
         .try_state::<CurrentFilePath>()
         .ok_or_else(|| "State not initialized".to_string())?;
-    let path = state
-        .0
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone();
+    let path = state.0.lock().map_err(|e| e.to_string())?.clone();
     Ok(path)
 }
 
@@ -123,13 +122,33 @@ fn main() {
             // Set up native menu
             #[cfg(desktop)]
             {
-                use tauri::menu::{MenuBuilder, SubmenuBuilder, MenuItemBuilder};
+                use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 
                 let file_menu = SubmenuBuilder::new(app, "File")
-                    .item(&MenuItemBuilder::new("New").id("menu-new").accelerator("CmdOrCtrl+N").build(app)?)
-                    .item(&MenuItemBuilder::new("Open...").id("menu-open").accelerator("CmdOrCtrl+O").build(app)?)
-                    .item(&MenuItemBuilder::new("Save").id("menu-save").accelerator("CmdOrCtrl+S").build(app)?)
-                    .item(&MenuItemBuilder::new("Save As...").id("menu-save-as").accelerator("CmdOrCtrl+Shift+S").build(app)?)
+                    .item(
+                        &MenuItemBuilder::new("New")
+                            .id("menu-new")
+                            .accelerator("CmdOrCtrl+N")
+                            .build(app)?,
+                    )
+                    .item(
+                        &MenuItemBuilder::new("Open...")
+                            .id("menu-open")
+                            .accelerator("CmdOrCtrl+O")
+                            .build(app)?,
+                    )
+                    .item(
+                        &MenuItemBuilder::new("Save")
+                            .id("menu-save")
+                            .accelerator("CmdOrCtrl+S")
+                            .build(app)?,
+                    )
+                    .item(
+                        &MenuItemBuilder::new("Save As...")
+                            .id("menu-save-as")
+                            .accelerator("CmdOrCtrl+Shift+S")
+                            .build(app)?,
+                    )
                     .separator()
                     .quit()
                     .build()?;
@@ -158,10 +177,18 @@ fn main() {
             let id = event.id().as_ref();
             if let Some(win) = app.get_webview_window("main") {
                 match id {
-                    "menu-new" => { let _ = win.emit("menu-action", "new"); }
-                    "menu-open" => { let _ = win.emit("menu-action", "open"); }
-                    "menu-save" => { let _ = win.emit("menu-action", "save"); }
-                    "menu-save-as" => { let _ = win.emit("menu-action", "save-as"); }
+                    "menu-new" => {
+                        let _ = win.emit("menu-action", "new");
+                    }
+                    "menu-open" => {
+                        let _ = win.emit("menu-action", "open");
+                    }
+                    "menu-save" => {
+                        let _ = win.emit("menu-action", "save");
+                    }
+                    "menu-save-as" => {
+                        let _ = win.emit("menu-action", "save-as");
+                    }
                     _ => {}
                 }
             }
