@@ -9,7 +9,8 @@
 
 use async_trait::async_trait;
 use langchart_adapters::llm::{
-    FinishReason, LlmAdapter, LlmError, LlmRequest, LlmResponse, Message, TokenUsage,
+    FinishReason, LlmAdapter, LlmError, LlmRequest, LlmResponse, Message, ResponseFormat,
+    TokenUsage,
 };
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -189,7 +190,8 @@ struct WatsonxChatRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
-    response_format: WatsonxResponseFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<WatsonxResponseFormat>,
 }
 
 impl WatsonxChatRequest {
@@ -207,6 +209,20 @@ impl WatsonxChatRequest {
             .into_iter()
             .map(WatsonxMessage::try_from)
             .collect::<Result<Vec<_>, _>>()?;
+        let response_format_kind = request.response_format.kind();
+        let response_format = match request.response_format {
+            ResponseFormat::Text => None,
+            ResponseFormat::JsonObject => Some(WatsonxResponseFormat {
+                kind: "json_object",
+            }),
+            ResponseFormat::JsonSchema { .. } => {
+                return Err(LlmError::UnsupportedResponseFormat {
+                    adapter: "watsonx".into(),
+                    requested: response_format_kind,
+                });
+            }
+        };
+
         Ok(Self {
             model_id: model.to_owned(),
             project_id,
@@ -214,9 +230,7 @@ impl WatsonxChatRequest {
             messages,
             temperature: request.model_policy.temperature,
             max_tokens: request.model_policy.max_tokens,
-            response_format: WatsonxResponseFormat {
-                kind: "json_object",
-            },
+            response_format,
         })
     }
 }
@@ -293,6 +307,7 @@ impl WatsonxChatResponse {
                     .unwrap_or(prompt_tokens.saturating_add(completion_tokens)),
             },
             finish_reason: map_finish_reason(choice.finish_reason.as_deref()),
+            refusal: None,
             model: self.model_version.unwrap_or(self.model_id),
         })
     }
@@ -462,6 +477,7 @@ mod tests {
                 content: "Return JSON".to_owned(),
             }],
             tools: Vec::new(),
+            response_format: ResponseFormat::Text,
         }
     }
 
@@ -491,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn request_serialization_selects_one_scope_and_json_output() {
+    fn text_request_serialization_omits_response_format() {
         let body = WatsonxChatRequest::from_request(
             "ibm/granite-4-h-small",
             &config(WatsonxScope::Project("project-1".to_owned())),
@@ -501,9 +517,46 @@ mod tests {
         let value = serde_json::to_value(body).unwrap();
         assert_eq!(value["project_id"], "project-1");
         assert!(value.get("space_id").is_none());
-        assert_eq!(value["response_format"], json!({"type": "json_object"}));
+        assert!(value.get("response_format").is_none());
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["max_tokens"], 512);
+    }
+
+    #[test]
+    fn json_object_request_serialization_includes_response_format() {
+        let mut request = request();
+        request.response_format = ResponseFormat::JsonObject;
+        let body = WatsonxChatRequest::from_request(
+            "ibm/granite-4-h-small",
+            &config(WatsonxScope::Project("project-1".to_owned())),
+            request,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(body).unwrap()["response_format"],
+            json!({"type": "json_object"})
+        );
+    }
+
+    #[test]
+    fn json_schema_is_rejected_explicitly() {
+        let mut request = request();
+        request.response_format = ResponseFormat::JsonSchema {
+            name: "result".into(),
+            description: None,
+            schema: json!({"type": "object"}),
+            strict: true,
+        };
+
+        assert!(matches!(
+            WatsonxChatRequest::from_request(
+                "ibm/granite-4-h-small",
+                &config(WatsonxScope::Project("project-1".to_owned())),
+                request,
+            ),
+            Err(LlmError::UnsupportedResponseFormat { .. })
+        ));
     }
 
     #[test]

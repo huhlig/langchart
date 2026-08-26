@@ -85,6 +85,7 @@ pub fn from_genai_response(resp: genai::chat::ChatResponse) -> LlmResponse {
         tool_calls,
         usage,
         finish_reason,
+        refusal: None,
         model,
     }
 }
@@ -103,6 +104,7 @@ mod tests {
             },
             messages,
             tools: vec![],
+            response_format: Default::default(),
         }
     }
 

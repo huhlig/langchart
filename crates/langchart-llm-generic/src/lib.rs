@@ -30,8 +30,8 @@
 
 use async_trait::async_trait;
 use langchart_adapters::llm::{
-    FinishReason, LlmAdapter, LlmError, LlmRequest, LlmResponse, Message, ModelInfo, TokenUsage,
-    ToolCall, ToolDefinition,
+    FinishReason, LlmAdapter, LlmError, LlmRequest, LlmResponse, Message, ModelInfo,
+    ResponseFormat, TokenUsage, ToolCall, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -218,6 +218,24 @@ struct OaiRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<OaiResponseFormat>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OaiResponseFormat {
+    JsonObject,
+    JsonSchema { json_schema: OaiJsonSchema },
+}
+
+#[derive(Serialize)]
+struct OaiJsonSchema {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    schema: serde_json::Value,
+    strict: bool,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +254,8 @@ struct OaiChoice {
 #[derive(Deserialize)]
 struct OaiChoiceMessage {
     content: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
     #[serde(default)]
     tool_calls: Vec<OaiToolCall>,
 }
@@ -263,10 +283,7 @@ impl GenericLlmAdapter {
         model: &str,
         req: &LlmRequest,
     ) -> Result<LlmResponse, LlmError> {
-        let api_key = self
-            .openai_api_key
-            .as_deref()
-            .filter(|k| !k.is_empty());
+        let api_key = self.openai_api_key.as_deref().filter(|k| !k.is_empty());
 
         let messages = req.messages.iter().map(msg_to_oai).collect::<Vec<_>>();
         let tools = req.tools.iter().map(tool_to_oai).collect::<Vec<_>>();
@@ -277,18 +294,19 @@ impl GenericLlmAdapter {
             tools,
             temperature: req.model_policy.temperature,
             max_tokens: req.model_policy.max_tokens,
+            response_format: oai_response_format(&req.response_format),
         };
 
         debug!(model = model, "openai request");
 
         let url = format!("{}/chat/completions", self.openai_base_url);
         let mut req_builder = self.client.post(&url);
-        
+
         // Only set bearer auth if API key is configured (not needed for local endpoints).
         if let Some(key) = api_key {
             req_builder = req_builder.bearer_auth(key);
         }
-        
+
         let resp = req_builder
             .json(&body)
             .send()
@@ -329,28 +347,23 @@ impl GenericLlmAdapter {
                 total_tokens: oai.usage.total_tokens,
             },
             finish_reason,
+            refusal: choice.message.refusal,
             model: oai.model,
         })
     }
 
     async fn list_openai_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        let api_key = self
-            .openai_api_key
-            .as_deref()
-            .filter(|k| !k.is_empty());
+        let api_key = self.openai_api_key.as_deref().filter(|k| !k.is_empty());
 
         let url = format!("{}/models", self.openai_base_url);
         let mut req_builder = self.client.get(&url);
-        
+
         // Only set bearer auth if API key is configured (not needed for local endpoints).
         if let Some(key) = api_key {
             req_builder = req_builder.bearer_auth(key);
         }
-        
-        let resp = req_builder
-            .send()
-            .await
-            .map_err(|e| http_to_llm_err(&e))?;
+
+        let resp = req_builder.send().await.map_err(|e| http_to_llm_err(&e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -435,6 +448,13 @@ impl GenericLlmAdapter {
         model: &str,
         req: &LlmRequest,
     ) -> Result<LlmResponse, LlmError> {
+        if !matches!(req.response_format, ResponseFormat::Text) {
+            return Err(LlmError::UnsupportedResponseFormat {
+                adapter: "anthropic".into(),
+                requested: req.response_format.kind(),
+            });
+        }
+
         let api_key = self
             .anthropic_api_key
             .as_deref()
@@ -565,6 +585,7 @@ impl GenericLlmAdapter {
                 total_tokens: total,
             },
             finish_reason,
+            refusal: None,
             model: anthropic.model,
         })
     }
@@ -612,6 +633,26 @@ fn tool_to_oai(t: &ToolDefinition) -> OaiTool {
             description: t.description.clone(),
             parameters: t.parameters.clone(),
         },
+    }
+}
+
+fn oai_response_format(format: &ResponseFormat) -> Option<OaiResponseFormat> {
+    match format {
+        ResponseFormat::Text => None,
+        ResponseFormat::JsonObject => Some(OaiResponseFormat::JsonObject),
+        ResponseFormat::JsonSchema {
+            name,
+            description,
+            schema,
+            strict,
+        } => Some(OaiResponseFormat::JsonSchema {
+            json_schema: OaiJsonSchema {
+                name: name.clone(),
+                description: description.clone(),
+                schema: schema.clone(),
+                strict: *strict,
+            },
+        }),
     }
 }
 
@@ -673,7 +714,7 @@ fn status_to_llm_err(status: u16, body: &str) -> LlmError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use langchart_adapters::llm::Message;
+    use langchart_adapters::llm::{Message, ResponseFormatKind};
 
     #[test]
     fn anthropic_model_detection() {
@@ -769,9 +810,187 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            response_format: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         // tools array should be absent (skip_serializing_if = Vec::is_empty)
         assert!(json.get("tools").is_none());
+    }
+
+    #[test]
+    fn oai_response_formats_have_exact_wire_shape() {
+        assert!(oai_response_format(&ResponseFormat::Text).is_none());
+        assert_eq!(
+            serde_json::to_value(oai_response_format(&ResponseFormat::JsonObject).unwrap())
+                .unwrap(),
+            serde_json::json!({"type": "json_object"})
+        );
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "additionalProperties": true
+        });
+        let format = ResponseFormat::JsonSchema {
+            name: "answer".into(),
+            description: Some("An answer".into()),
+            schema: schema.clone(),
+            strict: false,
+        };
+        assert_eq!(
+            serde_json::to_value(oai_response_format(&format).unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "description": "An answer",
+                    "schema": schema,
+                    "strict": false
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn openai_message_deserializes_refusal_separately() {
+        let message: OaiChoiceMessage = serde_json::from_value(serde_json::json!({
+            "content": null,
+            "refusal": "I cannot comply"
+        }))
+        .unwrap();
+
+        assert_eq!(message.content, None);
+        assert_eq!(message.refusal.as_deref(), Some("I cannot comply"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_rejects_structured_formats_before_provider_io() {
+        let adapter = GenericLlmAdapter::builder().build().unwrap();
+        let request = LlmRequest {
+            model_policy: langchart_model::policy::ModelPolicy {
+                model: Some("claude-test".into()),
+                ..Default::default()
+            },
+            messages: vec![],
+            tools: vec![],
+            response_format: ResponseFormat::JsonSchema {
+                name: "result".into(),
+                description: None,
+                schema: serde_json::json!({"type": "object"}),
+                strict: true,
+            },
+        };
+
+        assert!(matches!(
+            adapter.complete(request).await,
+            Err(LlmError::UnsupportedResponseFormat {
+                requested: ResponseFormatKind::JsonSchema,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn openai_http_body_preserves_schema_and_response_refusal() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request_bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before sending HTTP headers");
+                request_bytes.extend_from_slice(&buffer[..read]);
+                if let Some(position) = request_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request_bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request_bytes.len() < header_end + content_length {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before sending HTTP body");
+                request_bytes.extend_from_slice(&buffer[..read]);
+            }
+
+            let body: serde_json::Value =
+                serde_json::from_slice(&request_bytes[header_end..header_end + content_length])
+                    .unwrap();
+            let response_body = serde_json::json!({
+                "model": "test-model",
+                "choices": [{
+                    "message": {"content": null, "refusal": "declined"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            body
+        });
+
+        let adapter = GenericLlmAdapter::builder()
+            .openai_base_url(format!("http://{address}"))
+            .build()
+            .unwrap();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "additionalProperties": true
+        });
+        let response = adapter
+            .complete(LlmRequest {
+                model_policy: langchart_model::policy::ModelPolicy {
+                    model: Some("test-model".into()),
+                    ..Default::default()
+                },
+                messages: vec![Message::User {
+                    content: "answer".into(),
+                }],
+                tools: vec![],
+                response_format: ResponseFormat::JsonSchema {
+                    name: "answer".into(),
+                    description: Some("Exact answer".into()),
+                    schema: schema.clone(),
+                    strict: false,
+                },
+            })
+            .await
+            .unwrap();
+        let captured = server.await.unwrap();
+
+        assert_eq!(
+            captured["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "description": "Exact answer",
+                    "schema": schema,
+                    "strict": false
+                }
+            })
+        );
+        assert_eq!(response.content, None);
+        assert_eq!(response.refusal.as_deref(), Some("declined"));
+        assert_eq!(response.finish_reason, FinishReason::Stop);
     }
 }

@@ -1,5 +1,6 @@
 //! Runtime event sink and source adapters.
 
+use crate::llm::ResponseFormatKind;
 use async_trait::async_trait;
 use futures::Stream;
 use langchart_model::id::{EventId, RegionId, RunId, StateId};
@@ -68,6 +69,8 @@ pub enum RuntimeEventPayload {
         state_id: StateId,
         model: String,
         prompt_tokens: u32,
+        #[serde(default)]
+        response_format: ResponseFormatKind,
     },
     LlmResponse {
         state_id: StateId,
@@ -410,5 +413,19 @@ mod redaction_tests {
             }
             _ => panic!("wrong payload"),
         }
+    }
+
+    #[test]
+    fn llm_request_event_records_only_response_format_kind() {
+        let payload = RuntimeEventPayload::LlmRequest {
+            state_id: StateId::new("s"),
+            model: "test-model".into(),
+            prompt_tokens: 0,
+            response_format: ResponseFormatKind::JsonSchema,
+        };
+
+        let value = serde_json::to_value(payload).unwrap();
+        assert_eq!(value["response_format"], "json_schema");
+        assert!(value.get("schema").is_none());
     }
 }

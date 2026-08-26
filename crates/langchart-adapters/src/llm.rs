@@ -41,6 +41,55 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// The response representation required from an LLM provider.
+///
+/// Structured variants require native provider support. Adapters must return
+/// [`LlmError::UnsupportedResponseFormat`] rather than emulate or downgrade
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    #[default]
+    Text,
+    JsonObject,
+    JsonSchema {
+        name: String,
+        description: Option<String>,
+        schema: serde_json::Value,
+        strict: bool,
+    },
+}
+
+/// Non-sensitive response-format identifier used in errors and observability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFormatKind {
+    #[default]
+    Text,
+    JsonObject,
+    JsonSchema,
+}
+
+impl ResponseFormat {
+    pub fn kind(&self) -> ResponseFormatKind {
+        match self {
+            Self::Text => ResponseFormatKind::Text,
+            Self::JsonObject => ResponseFormatKind::JsonObject,
+            Self::JsonSchema { .. } => ResponseFormatKind::JsonSchema,
+        }
+    }
+}
+
+impl std::fmt::Display for ResponseFormatKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Text => "text",
+            Self::JsonObject => "json_object",
+            Self::JsonSchema => "json_schema",
+        })
+    }
+}
+
 /// A request to the LLM adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmRequest {
@@ -50,6 +99,9 @@ pub struct LlmRequest {
     pub messages: Vec<Message>,
     /// Tools available to the model for this call (from the capability envelope).
     pub tools: Vec<ToolDefinition>,
+    /// Required provider-native response representation.
+    #[serde(default)]
+    pub response_format: ResponseFormat,
 }
 
 /// Token usage for one LLM call.
@@ -80,6 +132,9 @@ pub struct LlmResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
     pub finish_reason: FinishReason,
+    /// Provider refusal, separate from ordinary response content.
+    #[serde(default)]
+    pub refusal: Option<String>,
     /// Raw model name returned by the provider.
     pub model: String,
 }
@@ -101,10 +156,58 @@ pub enum LlmError {
     ContextLengthExceeded,
     #[error("content filtered by provider")]
     ContentFiltered,
+    #[error("adapter `{adapter}` does not support response format `{requested}`")]
+    UnsupportedResponseFormat {
+        adapter: String,
+        requested: ResponseFormatKind,
+    },
     #[error("LLM provider error: {0}")]
     Provider(String),
     #[error("request timed out")]
     Timeout,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_response_format_deserializes_as_text() {
+        let request: LlmRequest = serde_json::from_value(serde_json::json!({
+            "model_policy": {},
+            "messages": [],
+            "tools": []
+        }))
+        .unwrap();
+
+        assert_eq!(request.response_format, ResponseFormat::Text);
+    }
+
+    #[test]
+    fn response_format_kinds_do_not_include_schema_material() {
+        let format = ResponseFormat::JsonSchema {
+            name: "result".into(),
+            description: Some("sensitive description".into()),
+            schema: serde_json::json!({"secret": "value"}),
+            strict: true,
+        };
+
+        assert_eq!(serde_json::to_value(format.kind()).unwrap(), "json_schema");
+    }
+
+    #[test]
+    fn missing_refusal_deserializes_as_none() {
+        let response: LlmResponse = serde_json::from_value(serde_json::json!({
+            "content": "ok",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "finish_reason": "stop",
+            "model": "test"
+        }))
+        .unwrap();
+
+        assert_eq!(response.refusal, None);
+    }
 }
 
 /// Abstraction over a language model provider.

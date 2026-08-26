@@ -102,6 +102,7 @@ fn broker_overhead(c: &mut Criterion) {
             content: "hello".into(),
         }],
         tools: vec![],
+        response_format: Default::default(),
     };
 
     c.bench_function("broker_rejects_unissued_envelope", |b| {

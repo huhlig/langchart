@@ -576,6 +576,7 @@ impl CapabilityBroker {
         envelope.turns_remaining -= 1;
 
         let model = request.model_policy.model.clone().unwrap_or_default();
+        let response_format = request.response_format.kind();
         self.await_active(
             &permit,
             self.emit(
@@ -584,6 +585,7 @@ impl CapabilityBroker {
                     state_id: envelope.state_id.clone(),
                     model: model.clone(),
                     prompt_tokens: 0, // real value arrives in the response
+                    response_format,
                 },
             ),
         )

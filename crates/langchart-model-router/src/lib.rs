@@ -209,6 +209,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::Stop,
+                refusal: None,
                 model: format!("fake/{}", req.model_policy.model.unwrap_or_default()),
             })
         }
@@ -226,6 +227,7 @@ mod tests {
                 content: "hi".into(),
             }],
             tools: vec![],
+            response_format: Default::default(),
         }
     }
 
@@ -325,5 +327,50 @@ mod tests {
     fn builder_rejects_empty_adapters() {
         let result = ModelRouter::builder().build();
         assert!(matches!(result, Err(BuildError::NoAdapters)));
+    }
+
+    #[tokio::test]
+    async fn router_preserves_complete_response_format() {
+        use langchart_adapters::llm::ResponseFormat;
+        use std::sync::Mutex;
+
+        struct CapturingAdapter(Arc<Mutex<Option<ResponseFormat>>>);
+
+        #[async_trait]
+        impl LlmAdapter for CapturingAdapter {
+            async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
+                *self.0.lock().unwrap() = Some(req.response_format);
+                Ok(LlmResponse {
+                    content: None,
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                    finish_reason: FinishReason::Stop,
+                    refusal: None,
+                    model: "captured".into(),
+                })
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let router = ModelRouter::builder()
+            .register("capture", Arc::new(CapturingAdapter(captured.clone())))
+            .fallback("capture")
+            .build()
+            .unwrap();
+        let expected = ResponseFormat::JsonSchema {
+            name: "review".into(),
+            description: Some("Exact contract".into()),
+            schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": true
+            }),
+            strict: false,
+        };
+        let mut request = make_request(Some("any-model"), None);
+        request.response_format = expected.clone();
+
+        router.complete(request).await.unwrap();
+
+        assert_eq!(*captured.lock().unwrap(), Some(expected));
     }
 }
