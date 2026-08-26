@@ -1,34 +1,34 @@
 # Langchart
 
-Langchart is a Rust workspace for defining, validating, and running governed,
-durable agentic workflows as hierarchical statecharts.
-
-The [`langchart`](crates/langchart) crate is the main public API. The workspace
-also contains the model, runtime, adapter contracts, concrete integrations,
-CLI, and WebAssembly bindings.
+Langchart is a Rust workspace for defining, validating, and running governed, durable agentic workflows as hierarchical
+statecharts. It combines deterministic statechart semantics with bounded agent autonomy: each agent can only use the
+tools, memory, and LLM calls explicitly allowed by the workflow definition.
 
 ## Getting started
 
-You need a recent stable Rust toolchain. Clone the repository, then validate
-the included workflow:
+Requires a recent stable Rust toolchain.
+
+**Validate the included example workflow:**
 
 ```console
 cargo run -p langchart-cli -- validate examples/hello-world.json
 ```
 
-To run the sample workflow editor:
-
-```console
-cargo tauri build --config crates/langchart-editor-tauri/tauri.conf.json
-```
-
-Run the workspace tests with:
+**Run the workspace test suite:**
 
 ```console
 cargo test --workspace
 ```
 
-To embed Langchart in another crate, add the facade and Tokio:
+**Build the desktop workflow editor:**
+
+```console
+cargo tauri build --config crates/langchart-editor-tauri/tauri.conf.json
+```
+
+## Embedding Langchart
+
+Add the facade crate and Tokio to your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -37,16 +37,15 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 ```
 
-Parse and validate a workflow before passing it to the runtime:
+Parse and validate a workflow document:
 
 ```rust
 use langchart::model::{validation, workflow::WorkflowDocument};
 
 fn load(source: &str) -> Result<WorkflowDocument, Box<dyn std::error::Error>> {
     let workflow: WorkflowDocument = serde_json::from_str(source)?;
-    let diagnostics = validation::validate(&workflow);
 
-    for diagnostic in &diagnostics {
+    for diagnostic in validation::validate(&workflow) {
         println!("{}: {}", diagnostic.code, diagnostic.message);
     }
 
@@ -55,30 +54,41 @@ fn load(source: &str) -> Result<WorkflowDocument, Box<dyn std::error::Error>> {
 }
 ```
 
-Runtime applications supply implementations of the adapter traits for LLMs,
-MCP, memory, secrets, artifacts, checkpoints, and events. See the
-[facade crate README](crates/langchart/README.md) for the next steps and
-[embedding guide](docs/embedding-guide.md) for complete runtime wiring.
+The runtime requires host-provided adapter implementations for LLM, MCP, memory, secrets, artifacts, checkpoints, and
+events. See the [facade crate README](crates/langchart/README.md) and the [embedding guide](docs/embedding-guide.md) for
+complete runtime wiring.
 
 ## Workspace crates
 
-| Crate | Purpose |
-| --- | --- |
-| [`langchart`](crates/langchart) | Public facade and re-exports |
-| [`langchart-model`](crates/langchart-model) | Workflow schema, IDs, validation, and CEL guards |
-| [`langchart-adapters`](crates/langchart-adapters) | External integration contracts |
-| [`langchart-runtime`](crates/langchart-runtime) | Async execution engine |
-| [`langchart-context`](crates/langchart-context) | Composable context resolution |
-| [`langchart-cli`](crates/langchart-cli) | Validate, run, replay, and inspect commands |
-| [`langchart-wasm`](crates/langchart-wasm) | Browser/editor validation bindings |
-| [`langchart-llm-watsonx`](crates/langchart-llm-watsonx) | IBM watsonx.ai LLM adapter |
-| [`langchart-docuvault`](crates/langchart-docuvault) | Optional Docuvault adapter bridge |
+| Crate                                                           | Purpose                                                                              |
+|-----------------------------------------------------------------|--------------------------------------------------------------------------------------|
+| [`langchart`](crates/langchart)                                 | Public facade — re-exports model, adapters, runtime, and context                     |
+| [`langchart-model`](crates/langchart-model)                     | Workflow schema, typed IDs, validation, and CEL guard compilation (WASM-compatible)  |
+| [`langchart-adapters`](crates/langchart-adapters)               | Integration trait contracts for LLM, MCP, memory, artifacts, checkpoints, and events |
+| [`langchart-runtime`](crates/langchart-runtime)                 | Async statechart execution engine with capability broker, timers, and replay         |
+| [`langchart-context`](crates/langchart-context)                 | Composable `ContextResolverChain` with built-in pipeline stages                      |
+| [`langchart-cli`](crates/langchart-cli)                         | `langchart` CLI binary — validate, run, replay, and inspect commands                 |
+| [`langchart-wasm`](crates/langchart-wasm)                       | WebAssembly bindings for in-browser workflow validation and inspection               |
+| [`langchart-llm-generic`](crates/langchart-llm-generic)         | `LlmAdapter` for OpenAI, Anthropic, and any OpenAI-compatible endpoint               |
+| [`langchart-llm-genai`](crates/langchart-llm-genai)             | `LlmAdapter` backed by `genai` (Gemini, Groq, Cohere, xAI, DeepSeek)                 |
+| [`langchart-llm-watsonx`](crates/langchart-llm-watsonx)         | IBM watsonx.ai `LlmAdapter` with IAM authentication                                  |
+| [`langchart-mcp-client`](crates/langchart-mcp-client)           | `McpAdapter` over child-process MCP servers via `rmcp`                               |
+| [`langchart-artifact-fs`](crates/langchart-artifact-fs)         | File-system `ArtifactStore` with atomic writes and optimistic concurrency            |
+| [`langchart-checkpoint-redb`](crates/langchart-checkpoint-redb) | Embedded redb-backed `CheckpointStore`                                               |
+| [`langchart-memory-redb`](crates/langchart-memory-redb)         | Embedded redb-backed `MemoryAdapter`                                                 |
+| [`langchart-model-router`](crates/langchart-model-router)       | Policy-driven `LlmAdapter` router for multi-provider deployments                     |
+| [`langchart-editor-tauri`](crates/langchart-editor-tauri)       | Standalone Tauri desktop editor for authoring workflows                              |
+| [`langchart-docuvault`](crates/langchart-docuvault)             | Optional bridge onto Docuvault artifact, memory, and context APIs                    |
 
-The remaining crates provide concrete artifact, checkpoint, memory, LLM, MCP,
-document-vault, and model-routing integrations.
+### Optional crate: langchart-docuvault
 
-Docuvault support is excluded from default workspace builds. Build it directly
-with `cargo check -p langchart-docuvault`, or expose it through the facade with:
+Docuvault support is excluded from default workspace builds because it depends on a Git source. Build it explicitly:
+
+```console
+cargo check -p langchart-docuvault
+```
+
+Or enable the facade feature to bring it into your application:
 
 ```toml
 langchart = { path = "path/to/langchart/crates/langchart", features = ["docuvault"] }

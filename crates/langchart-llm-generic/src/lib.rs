@@ -32,9 +32,9 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use langchart_adapters::llm::{
-    buffered_response_stream, FinishReason, LlmAdapter, LlmError, LlmEventStream, LlmRequest,
-    LlmResponse, LlmStreamEvent, Message, ModelInfo, ResponseBodyMetadata, ResponseFormat,
-    TokenUsage, ToolCall, ToolDefinition, TransportStage,
+    FinishReason, LlmAdapter, LlmError, LlmEventStream, LlmRequest, LlmResponse, LlmStreamEvent,
+    Message, ModelInfo, ResponseBodyMetadata, ResponseFormat, TokenUsage, ToolCall, ToolDefinition,
+    TransportStage, buffered_response_stream,
 };
 use reqwest::header::HeaderMap;
 use serde::de::DeserializeOwned;
@@ -162,9 +162,9 @@ impl GenericLlmAdapterBuilder {
             stream_idle_timeout: self
                 .stream_idle_timeout
                 .unwrap_or(Duration::from_secs(DEFAULT_STREAM_IDLE_TIMEOUT_SECS)),
-            total_generation_timeout: self.total_generation_timeout.unwrap_or(Duration::from_secs(
-                DEFAULT_TOTAL_GENERATION_TIMEOUT_SECS,
-            )),
+            total_generation_timeout: self
+                .total_generation_timeout
+                .unwrap_or(Duration::from_secs(DEFAULT_TOTAL_GENERATION_TIMEOUT_SECS)),
         })
     }
 }
@@ -534,10 +534,19 @@ impl GenericLlmAdapter {
             .map_err(|error| http_to_llm_err(&error))?;
 
         if !response.status().is_success() {
-            return match tokio::time::timeout_at(total_deadline, self.decode_response::<serde_json::Value>(response)).await {
+            return match tokio::time::timeout_at(
+                total_deadline,
+                self.decode_response::<serde_json::Value>(response),
+            )
+            .await
+            {
                 Ok(Err(error)) => Err(error),
-                Ok(Ok(_)) => Err(LlmError::Provider("unexpected successful error response decode".into())),
-                Err(_) => Err(generation_timeout_error("total generation deadline exceeded while reading error response")),
+                Ok(Ok(_)) => Err(LlmError::Provider(
+                    "unexpected successful error response decode".into(),
+                )),
+                Err(_) => Err(generation_timeout_error(
+                    "total generation deadline exceeded while reading error response",
+                )),
             };
         }
 

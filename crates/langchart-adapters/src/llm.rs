@@ -1,7 +1,7 @@
 //! LLM adapter: abstract over model providers.
 
 use async_trait::async_trait;
-use futures::{stream, Stream};
+use futures::{Stream, stream};
 use langchart_model::policy::ModelPolicy;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;

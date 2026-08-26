@@ -5,9 +5,8 @@ File-system backed [`ArtifactStore`][adapters] implementation for the
 
 ## Overview
 
-`FsArtifactStore` stores versioned artifacts in a flat directory layout on any
-local file system. It supports atomic writes, optimistic concurrency control
-(version-precondition commits), and proposal staging — making it suitable for
+`FsArtifactStore` stores versioned artifacts in a flat directory layout on any local file system. It supports atomic
+writes, optimistic concurrency control (version-precondition commits), and proposal staging — making it suitable for
 development, testing, and single-node production deployments.
 
 ## Layout
@@ -23,8 +22,7 @@ Given a root directory `<root>`, each artifact gets its own subdirectory:
     latest.txt            — current committed version ULID
 ```
 
-Writes use an atomic rename (`write to <ulid>.tmp`, then `rename`) so partial
-writes are never visible to readers.
+Writes use an atomic rename (`write to <ulid>.tmp`, then `rename`) so partial writes are never visible to readers.
 
 ## Usage
 
@@ -60,11 +58,11 @@ async fn main() -> anyhow::Result<()> {
 
 `FsArtifactStore` uses optimistic concurrency: `commit` requires the caller's
 `expected_base` to match the proposal's stored `base_version`, then checks that
-`latest.txt` still matches that base before writing. Initial proposals use the
-sentinel version `"none"`. Conflicts return `ArtifactError::VersionConflict`.
+`latest.txt` still matches that base before writing. Initial proposals use the sentinel version `"none"`. Conflicts
+return `ArtifactError::VersionConflict`.
 
-Multiple `FsArtifactStore` instances pointing at the same root directory serialize
-commits through an OS-backed lock and use atomic `rename` for file replacement.
+Multiple `FsArtifactStore` instances pointing at the same root directory serialize commits through an OS-backed lock and
+use atomic `rename` for file replacement.
 
 ## Feature flags
 
