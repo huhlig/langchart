@@ -8,10 +8,8 @@
 //!
 //! ## Modules
 //!
-//! - [`types`] — canonical statechart type definitions
 //! - [`workflow`] — workflow document and identity types
-//! - [`state`] — state, state type, and lifecycle types
-//! - [`transition`] — transition, event envelope, and guard types
+//! - [`state`] — state, transition, and lifecycle types
 //! - [`policy`] — capability, context, and model policy types
 //! - [`validation`] — structural and semantic validation
 //! - [`guard`] — CEL guard compilation and evaluation
@@ -25,6 +23,5 @@ pub mod id;
 pub mod policy;
 pub mod schema;
 pub mod state;
-pub mod transition;
 pub mod validation;
 pub mod workflow;

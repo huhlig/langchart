@@ -138,10 +138,10 @@ pub struct StateDefinition {
     pub authorized_roles: Vec<String>,
 
     // ── Lifecycle ──
-    /// CEL expressions evaluated as entry actions (pure data transforms).
+    /// Registered action IDs executed in order when the state is entered.
     #[serde(default)]
     pub on_entry: Vec<String>,
-    /// CEL expressions evaluated as exit actions (pure data transforms).
+    /// Registered action IDs executed in order when the state is exited.
     #[serde(default)]
     pub on_exit: Vec<String>,
     /// Retry policy for this state's activity.
