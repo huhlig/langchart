@@ -102,12 +102,17 @@ impl TraceReplayer {
             .trace
             .iter()
             .filter_map(|e| {
-                if let RuntimeEventPayload::TransitionSelected { event_type, .. } = &e.payload {
+                if let RuntimeEventPayload::TransitionSelected {
+                    event_type,
+                    event_payload,
+                    ..
+                } = &e.payload
+                {
                     // Skip internal synthetic events produced by the runtime itself.
                     if event_type.starts_with("parallel.completed") {
                         return None;
                     }
-                    Some((event_type.clone(), serde_json::Value::Null))
+                    Some((event_type.clone(), event_payload.clone()))
                 } else {
                     None
                 }
@@ -369,5 +374,41 @@ mod tests {
 
         assert_eq!(replayed.final_status, RunStatus::Completed);
         assert!(replayed.has_payload(|p| matches!(p, RuntimeEventPayload::RunCompleted)));
+    }
+
+    #[tokio::test]
+    async fn trace_replayer_preserves_payload_for_guarded_transition() {
+        let mut doc = minimal_agentic_doc();
+        let work = &mut doc.states[0];
+        work.state_type = StateType::Human;
+        work.agent = None;
+        work.prompt = None;
+        work.authorized_roles = vec!["operator".into()];
+        work.on.get_mut("task.done").unwrap()[0].guard = Some("approved == true".into());
+
+        let compiled = Arc::new(compile(doc).expect("compile"));
+        let original = WorkflowSimulator::new(compiled.clone())
+            .inject("task.done", serde_json::json!({ "approved": true }))
+            .run()
+            .await
+            .expect("original run");
+
+        assert_eq!(original.status, RunStatus::Completed);
+        assert!(original.events.iter().any(|event| matches!(
+            &event.payload,
+            RuntimeEventPayload::TransitionSelected { event_payload, .. }
+                if event_payload == &serde_json::json!({ "approved": true })
+        )));
+
+        let replayed = TraceReplayer::new(compiled, original.events)
+            .replay()
+            .await
+            .expect("replay");
+
+        assert_eq!(replayed.final_status, RunStatus::Completed);
+        assert!(replayed.has_payload(|payload| matches!(
+            payload,
+            RuntimeEventPayload::TransitionSelected { to, .. } if to.0 == "end"
+        )));
     }
 }

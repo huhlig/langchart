@@ -43,6 +43,9 @@ pub enum RuntimeEventPayload {
         from: StateId,
         to: StateId,
         event_type: String,
+        /// Payload of the causal event, retained so the transition can be replayed.
+        #[serde(default)]
+        event_payload: serde_json::Value,
     },
 
     // Activities
@@ -427,5 +430,22 @@ mod redaction_tests {
         let value = serde_json::to_value(payload).unwrap();
         assert_eq!(value["response_format"], "json_schema");
         assert!(value.get("schema").is_none());
+    }
+
+    #[test]
+    fn old_transition_event_without_payload_defaults_to_null() {
+        let payload: RuntimeEventPayload = serde_json::from_value(serde_json::json!({
+            "kind": "transition_selected",
+            "from": "source",
+            "to": "target",
+            "event_type": "continue"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            payload,
+            RuntimeEventPayload::TransitionSelected { event_payload, .. }
+                if event_payload.is_null()
+        ));
     }
 }

@@ -682,6 +682,7 @@ impl WorkflowInstance {
                 from: source_state_id.clone(),
                 to: target_id.clone(),
                 event_type: event.event_type.clone(),
+                event_payload: event.payload.clone(),
             })
             .await?;
 
@@ -1282,6 +1283,7 @@ impl WorkflowInstance {
                 from: parallel_id.clone(),
                 to: target.clone(),
                 event_type: "parallel.completed".into(),
+                event_payload: serde_json::Value::Null,
             })
             .await?;
             self.enter_state(&target).await?;
@@ -1892,6 +1894,7 @@ impl WorkflowInstance {
                     from: state_id.clone(),
                     to: target_id.clone(),
                     event_type: "retry.exhausted".into(),
+                    event_payload: serde_json::json!({ "error": message }),
                 })
                 .await?;
                 self.exit_state(&state_id).await?;
