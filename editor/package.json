@@ -27,6 +27,7 @@
     "typecheck":    "tsc --noEmit",
     "wasm:build":         "wasm-pack build ../crates/langchart-wasm --target web --out-dir ../../editor/src/wasm --out-name langchart_wasm --dev",
     "wasm:build:release": "wasm-pack build ../crates/langchart-wasm --target web --out-dir ../../editor/src/wasm --out-name langchart_wasm --release",
+    "wasm:test":          "wasm-pack test --node ../crates/langchart-wasm",
     "build:full":         "npm run wasm:build && npm run build",
     "build:full:release": "npm run wasm:build:release && npm run build"
   },

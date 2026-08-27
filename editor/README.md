@@ -146,4 +146,4 @@ state.updateRunSnapshot({
 - [ ] Compound state drill-down (Phase 5 full)
 - [ ] Drag-to-rearrange canvas nodes
 - [ ] YAML import (requires host app Rust layer for parse)
-- [ ] wasm-pack test integration in CI
+- [x] wasm-pack test integration (`npm run wasm:test`)

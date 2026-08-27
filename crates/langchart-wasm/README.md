@@ -40,6 +40,12 @@ From the repository root, build with `wasm-pack`:
 wasm-pack build crates/langchart-wasm --target web
 ```
 
+Run the exported API integration tests in Node's WebAssembly runtime:
+
+```console
+wasm-pack test --node crates/langchart-wasm
+```
+
 The WASM package is consumed by [`langchart-editor-tauri`](../langchart-editor-tauri) for in-editor validation.
 
 ## License
