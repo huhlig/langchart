@@ -986,7 +986,7 @@ impl WorkflowInstance {
                             self.workflow
                                 .guards
                                 .get(&key)
-                                .map(|guard| self.evaluate_guard(guard, event))
+                                .map(|guard| self.evaluate_guard(guard, event, &probe_id))
                                 .unwrap_or(false)
                         } else {
                             true
@@ -1048,6 +1048,7 @@ impl WorkflowInstance {
         &self,
         guard: &langchart_model::guard::CompiledGuard,
         event: &QueuedEvent,
+        state_id: &StateId,
     ) -> bool {
         let mut ctx = langchart_model::guard::evaluation_context();
 
@@ -1066,14 +1067,56 @@ impl WorkflowInstance {
             self.workflow.document.version.0.as_str(),
         );
 
+        let workflow_data = self
+            .workflow_data
+            .as_ref()
+            .and_then(|data| serde_json::to_value(data).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let event_context = serde_json::json!({
+            "type": event.event_type,
+            "payload": event.payload,
+        });
+        if let Ok(value) = cel_interpreter::to_value(&event_context) {
+            let _ = ctx.add_variable("event", value);
+        }
+
+        let mut workflow_context = match &workflow_data {
+            serde_json::Value::Object(fields) => fields.clone(),
+            _ => serde_json::Map::new(),
+        };
+        workflow_context.insert(
+            "id".into(),
+            serde_json::Value::String(self.workflow.document.id.0.clone()),
+        );
+        workflow_context.insert(
+            "version".into(),
+            serde_json::Value::String(self.workflow.document.version.0.clone()),
+        );
+        workflow_context.insert("data".into(), workflow_data.clone());
+        if let Ok(value) = cel_interpreter::to_value(serde_json::Value::Object(workflow_context)) {
+            let _ = ctx.add_variable("workflow", value);
+        }
+
+        if let Ok(value) = cel_interpreter::to_value(serde_json::json!({ "id": self.run_id.0 })) {
+            let _ = ctx.add_variable("run", value);
+        }
+
+        if let Some(state) = self.find_state_def(state_id)
+            && let Ok(value) = cel_interpreter::to_value(serde_json::json!({
+                "id": state.id,
+                "name": state.name,
+                "type": state.state_type,
+            }))
+        {
+            let _ = ctx.add_variable("state", value);
+        }
+
         // ── F1: Workflow data fields ───────────────────────────────────────────
         // Expose top-level workflow data fields as `data.<field>` in CEL.
         // The ron::Value is first round-tripped through serde_json so we can use
         // cel_interpreter::to_value for the actual CEL conversion.
-        if let Some(wd) = &self.workflow_data
-            && let Ok(json_val) = serde_json::to_value(wd)
-            && let Ok(cel_val) = cel_interpreter::to_value(&json_val)
-        {
+        if let Ok(cel_val) = cel_interpreter::to_value(&workflow_data) {
             let _ = ctx.add_variable("data", cel_val);
         }
 

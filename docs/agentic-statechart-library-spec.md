@@ -463,9 +463,14 @@ A transition defines:
 **Guard evaluation:**
 
 Guards are CEL expressions evaluated against a context object containing:
-- `event`: the triggering event envelope and payload;
-- `workflow`: current workflow data;
-- `state`: state-local data.
+- `event`: the triggering event type and payload (`event.type`, `event.payload`);
+- `workflow`: workflow identity plus current data fields (`workflow.id`, `workflow.version`,
+  `workflow.<field>`, and the complete data object at `workflow.data`);
+- `run`: run identity (`run.id`);
+- `state`: source-state metadata (`state.id`, `state.name`, `state.type`).
+
+For compatibility with schema 1.x workflows, the runtime also exposes `data.<field>`, `run_id`, `workflow_id`,
+`workflow_version`, and top-level event-payload fields. New workflows SHOULD use the structured namespaces.
 
 Guards MUST be deterministic and side-effect free. A guard MUST NOT invoke an LLM, MCP tool, or any I/O. This is
 enforced at compile time by CEL's pure-expression semantics.

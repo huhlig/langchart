@@ -2701,6 +2701,46 @@ async fn cel_guard_combines_context_and_payload() {
 
 // ── C1: ContextResolverChain integration test ─────────────────────────────────
 
+#[tokio::test]
+async fn cel_guard_supports_structured_context_namespaces() {
+    let guard = concat!(
+        "event.type == 'go' && event.payload.approved == true && ",
+        "workflow.id == 'wf-structured-context' && workflow.version == '0.1.0' && ",
+        "workflow.flag == true && workflow.data.flag == true && ",
+        "run.id == 'r-structured-context' && ",
+        "state.id == 'start' && state.name == 'start' && state.type == 'atomic'"
+    );
+    let states = vec![
+        with_transition(
+            leaf_state("start", StateType::Atomic),
+            "go",
+            "end",
+            Some(guard),
+        ),
+        leaf_state("end", StateType::Final),
+    ];
+    let compiled =
+        Arc::new(compile(base_doc("wf-structured-context", states, "start")).expect("compile"));
+    let sink = Arc::new(VecSink::default());
+    let broker = bare_broker(sink.clone());
+    let mut inst = WorkflowInstance::new(
+        RunId::new("r-structured-context"),
+        compiled,
+        broker,
+        sink,
+        HashMap::new(),
+    )
+    .with_workflow_data(ron::from_str(r#"{"flag": true}"#).expect("workflow data"));
+
+    inst.start().await.expect("start");
+    inst.send("go", serde_json::json!({ "approved": true }));
+
+    assert_eq!(
+        inst.run_to_completion().await.expect("run"),
+        RunStatus::Completed
+    );
+}
+
 /// 21. When a `ContextResolverChain` is injected, the agent invocation receives
 ///     non-empty `context_view` items from the stage.
 ///

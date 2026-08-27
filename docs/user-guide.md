@@ -205,6 +205,9 @@ Guards use the [Common Expression Language](https://cel.dev). Available variable
 | `workflow.id` | Workflow ID |
 | `workflow.version` | Workflow version |
 | `run.id` | Run ID |
+| `state.id` | Source state ID |
+| `state.name` | Source state name |
+| `state.type` | Source state type |
 | `data.<field>` | Workflow data fields (if `with_workflow_data` was called) |
 
 Example guards:
@@ -214,6 +217,10 @@ event.payload.confidence >= 0.8
 event.payload.status == "approved"
 data.retry_count < 3
 ```
+
+Schema 1.x flat aliases (`approved`, `data.<field>`, `run_id`, `workflow_id`, and `workflow_version`) remain
+available for compatibility. Prefer the structured variables in new workflows. Workflow data is also available as
+`workflow.<field>` and as the complete object at `workflow.data`.
 
 ### Retry policy
 
