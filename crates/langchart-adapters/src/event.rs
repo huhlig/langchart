@@ -159,6 +159,8 @@ pub enum RuntimeEventPayload {
     },
     HumanInputReceived {
         state_id: StateId,
+        #[serde(default)]
+        role: String,
     },
     HumanConfirmationRequired {
         state_id: StateId,

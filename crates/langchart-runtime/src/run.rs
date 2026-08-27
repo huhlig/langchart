@@ -137,6 +137,8 @@ pub enum EventSource {
     Timer { timer_id: crate::timer::TimerId },
     /// Delivered externally (human input, integration, etc.).
     External,
+    /// Submitted for one active Human state by an identified caller role.
+    Human { state_id: StateId, role: String },
     /// Broadcast by an integration. An unhandled broadcast is observable but
     /// does not fail a workflow whose strict unhandled-event policy is enabled.
     ExternalBroadcast,
@@ -513,6 +515,38 @@ impl WorkflowInstance {
         });
     }
 
+    /// Submit authorized input to one active Human state.
+    pub fn submit_human_input(
+        &mut self,
+        state_id: StateId,
+        role: impl Into<String>,
+        event_type: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<(), EngineError> {
+        let role = role.into();
+        let state = self
+            .find_state_def(&state_id)
+            .filter(|state| state.state_type == StateType::Human)
+            .ok_or_else(|| EngineError::HumanStateNotActive(state_id.clone()))?;
+        if !self.active_states.contains(&state_id) {
+            return Err(EngineError::HumanStateNotActive(state_id));
+        }
+        if !state
+            .authorized_roles
+            .iter()
+            .any(|allowed| allowed == &role)
+        {
+            return Err(EngineError::HumanRoleNotAuthorized { state_id, role });
+        }
+
+        self.event_queue.push_back(QueuedEvent {
+            event_type: event_type.into(),
+            payload,
+            source: EventSource::Human { state_id, role },
+        });
+        Ok(())
+    }
+
     /// Enqueue an integration broadcast that may be irrelevant to the current
     /// state. Unlike directed external input, an unhandled broadcast never
     /// fails the run.
@@ -736,6 +770,16 @@ impl WorkflowInstance {
         for (source_state_id, spec) in transitions {
             let target_id = spec.target.clone();
 
+            if let EventSource::Human { state_id, role } = &event.source
+                && state_id == &source_state_id
+            {
+                self.emit(RuntimeEventPayload::HumanInputReceived {
+                    state_id: source_state_id.clone(),
+                    role: role.clone(),
+                })
+                .await?;
+            }
+
             self.emit(RuntimeEventPayload::TransitionSelected {
                 from: source_state_id.clone(),
                 to: target_id.clone(),
@@ -915,6 +959,18 @@ impl WorkflowInstance {
             let probe_chain = std::iter::once(state_id.clone()).chain(ancestors);
 
             for probe_id in probe_chain {
+                if let EventSource::Human { state_id, .. } = &event.source
+                    && state_id != &probe_id
+                {
+                    continue;
+                }
+
+                if let Some(state_def) = self.find_state_def(&probe_id)
+                    && !human_event_is_authorized(state_def, event)
+                {
+                    continue;
+                }
+
                 if let Some(state_def) = self.find_state_def(&probe_id)
                     && let Some(specs) = state_def.on.get(&event.event_type)
                 {
@@ -2523,6 +2579,22 @@ impl Drop for WorkflowInstance {
         }
         for (_, handle) in self.retry_tasks.drain() {
             handle.abort();
+        }
+    }
+}
+
+fn human_event_is_authorized(state: &StateDefinition, event: &QueuedEvent) -> bool {
+    if state.state_type != StateType::Human {
+        return true;
+    }
+
+    match &event.source {
+        EventSource::Human { state_id, role } => {
+            state_id == &state.id && state.authorized_roles.iter().any(|allowed| allowed == role)
+        }
+        EventSource::Timer { .. } | EventSource::Internal => true,
+        EventSource::Activity { .. } | EventSource::External | EventSource::ExternalBroadcast => {
+            false
         }
     }
 }

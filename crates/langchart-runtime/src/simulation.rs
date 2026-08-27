@@ -229,7 +229,7 @@ impl SimulationResult {
 pub struct WorkflowSimulator {
     workflow: Arc<CompiledWorkflow>,
     actors: HashMap<StateId, Arc<dyn AgentActor>>,
-    initial_events: Vec<(String, serde_json::Value)>,
+    initial_events: Vec<SimulationInput>,
     /// Maximum RTC steps before giving up.  Default 10 000.
     step_limit: usize,
 }
@@ -252,7 +252,27 @@ impl WorkflowSimulator {
 
     /// Add an event that will be injected immediately after `start()`.
     pub fn inject(mut self, event_type: impl Into<String>, payload: serde_json::Value) -> Self {
-        self.initial_events.push((event_type.into(), payload));
+        self.initial_events.push(SimulationInput::External {
+            event_type: event_type.into(),
+            payload,
+        });
+        self
+    }
+
+    /// Add authorized input for a Human state immediately after `start()`.
+    pub fn inject_human(
+        mut self,
+        state_id: impl Into<StateId>,
+        role: impl Into<String>,
+        event_type: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        self.initial_events.push(SimulationInput::Human {
+            state_id: state_id.into(),
+            role: role.into(),
+            event_type: event_type.into(),
+            payload,
+        });
         self
     }
 
@@ -290,8 +310,19 @@ impl WorkflowSimulator {
 
         instance.start().await?;
 
-        for (event_type, payload) in self.initial_events {
-            instance.send(event_type, payload);
+        for input in self.initial_events {
+            match input {
+                SimulationInput::External {
+                    event_type,
+                    payload,
+                } => instance.send(event_type, payload),
+                SimulationInput::Human {
+                    state_id,
+                    role,
+                    event_type,
+                    payload,
+                } => instance.submit_human_input(state_id, role, event_type, payload)?,
+            }
         }
 
         // Drive with a bounded step loop so stuck workflows don't deadlock.
@@ -307,6 +338,19 @@ impl WorkflowSimulator {
 
         Ok(SimulationResult { status, events })
     }
+}
+
+enum SimulationInput {
+    External {
+        event_type: String,
+        payload: serde_json::Value,
+    },
+    Human {
+        state_id: StateId,
+        role: String,
+        event_type: String,
+        payload: serde_json::Value,
+    },
 }
 
 pub(crate) fn build_sim_broker_pub(sink: Arc<CapturingSink>) -> Arc<CapabilityBroker> {

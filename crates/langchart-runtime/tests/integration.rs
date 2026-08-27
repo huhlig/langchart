@@ -30,7 +30,7 @@ use langchart_model::{
     workflow::{AgentDefinition, WorkflowDocument},
 };
 use langchart_runtime::{
-    RuntimeEngine,
+    EngineError, RuntimeEngine,
     broker::CapabilityBroker,
     engine::EngineAdapters,
     instance::{AgentActor, ScriptedAgentActor},
@@ -273,6 +273,85 @@ async fn idle_step_remains_non_blocking_for_simulation() {
     inst.start().await.expect("start");
 
     assert!(!inst.step().await.expect("step"));
+}
+
+#[tokio::test]
+async fn human_state_requires_authorized_submission() {
+    let mut review = with_transition(
+        leaf_state("review", StateType::Human),
+        "approve",
+        "end",
+        None,
+    );
+    review.authorized_roles = vec!["reviewer".into()];
+    let doc = base_doc(
+        "wf-human-authorization",
+        vec![review, leaf_state("end", StateType::Final)],
+        "review",
+    );
+    let compiled = Arc::new(compile(doc).expect("compile"));
+    let sink = Arc::new(VecSink::default());
+    let broker = bare_broker(sink.clone());
+    let mut inst = WorkflowInstance::new(
+        RunId::new("r-human-authorization"),
+        compiled,
+        broker,
+        sink.clone(),
+        HashMap::new(),
+    );
+
+    inst.start().await.expect("start");
+
+    inst.send("approve", serde_json::Value::Null);
+    assert!(!inst.step().await.expect("ordinary event"));
+    assert!(inst.active_states.contains(&StateId::new("review")));
+
+    let error = inst
+        .submit_human_input(
+            StateId::new("review"),
+            "viewer",
+            "approve",
+            serde_json::Value::Null,
+        )
+        .expect_err("unauthorized role");
+    assert!(matches!(
+        error,
+        EngineError::HumanRoleNotAuthorized { state_id, role }
+            if state_id == StateId::new("review") && role == "viewer"
+    ));
+
+    inst.submit_human_input(
+        StateId::new("review"),
+        "reviewer",
+        "approve",
+        serde_json::Value::Null,
+    )
+    .expect("authorized input");
+    assert_eq!(
+        inst.run_to_completion().await.expect("run"),
+        RunStatus::Completed
+    );
+
+    let payloads = sink.payloads().await;
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        RuntimeEventPayload::HumanInputRequested { state_id }
+            if state_id == &StateId::new("review")
+    )));
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| {
+                matches!(
+                    payload,
+                    RuntimeEventPayload::HumanInputReceived { state_id, role }
+                        if state_id == &StateId::new("review")
+                            && role == "reviewer"
+                )
+            })
+            .count(),
+        1
+    );
 }
 
 /// 2. Atomic → Agentic (ScriptedActor) → Final. Full agent lifecycle exercised.

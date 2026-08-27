@@ -149,7 +149,7 @@ let run_id = engine.start(compiled, actors).await?;
 | `agentic` | Runs an agent actor; transitions on the emitted output event |
 | `compound` | Contains nested states; provides a hierarchical structure |
 | `parallel` | Runs multiple orthogonal regions concurrently |
-| `human` | Suspends until a human decision event arrives |
+| `human` | Waits for authorized, targeted human input |
 | `subworkflow` | Invokes a separately versioned workflow via port bindings |
 | `final` | End state; marks completion of a region or workflow |
 
@@ -231,6 +231,39 @@ data.retry_count < 3
 ```
 
 When all attempts are exhausted the workflow transitions to `on_exhausted`. Each retry attempt creates a distinct observable event record.
+
+### Human input
+
+A Human state declares the roles allowed to submit its decision:
+
+```json
+{
+  "id": "review",
+  "type": "human",
+  "authorized_roles": ["reviewer"],
+  "on": {
+    "review.approved": [{ "target": "publish", "priority": 0, "actions": [] }]
+  }
+}
+```
+
+After authenticating the caller, the host submits the decision to that specific active state:
+
+```rust
+engine
+    .submit_human_input(
+        &run_id,
+        StateId::new("review"),
+        "reviewer",
+        "review.approved",
+        serde_json::json!({ "comment": "Ready to publish" }),
+    )
+    .await?;
+```
+
+Ordinary `send` calls cannot satisfy a Human-state transition. Human input is targeted, cannot bubble to an
+ancestor or another active state, and is rejected when the state is inactive or the supplied role is not listed in
+`authorized_roles`. The host remains responsible for authenticating the caller before supplying that role.
 
 ### History
 

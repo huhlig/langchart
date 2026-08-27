@@ -444,6 +444,12 @@ Invalid events are rejected with an observable error record; they do not silentl
 flow through the same validated event channel. The event envelope's `correlation_id` and `causation_id` fields
 distinguish the causal chain.
 
+Human-state input is a distinct host submission carrying a target state ID and an authenticated caller role. The
+runtime MUST accept it only when the target Human state is active and the role appears in that state's
+`authorized_roles`. It MUST route the event only to that state, without ancestor bubbling or parallel fan-out.
+Ordinary external events MUST NOT satisfy transitions declared directly on a Human state. The embedding host is
+responsible for authenticating the caller before assigning the submitted role.
+
 ### 8.2 Transition Selection
 
 A transition defines:

@@ -97,27 +97,38 @@ impl TraceReplayer {
 
         instance.start().await?;
 
-        // Extract transition events from the trace in order.
-        let causal_events: Vec<(String, serde_json::Value)> = self
-            .trace
-            .iter()
-            .filter_map(|e| {
-                if let RuntimeEventPayload::TransitionSelected {
+        // Extract transition-driving inputs from the trace in order. Human
+        // receipt records immediately precede their selected transition.
+        let mut pending_human_roles = HashMap::new();
+        let mut causal_events = Vec::new();
+        for event in &self.trace {
+            match &event.payload {
+                RuntimeEventPayload::HumanInputReceived { state_id, role } => {
+                    pending_human_roles.insert(state_id.clone(), role.clone());
+                }
+                RuntimeEventPayload::TransitionSelected {
+                    from,
                     event_type,
                     event_payload,
                     ..
-                } = &e.payload
-                {
-                    // Skip internal synthetic events produced by the runtime itself.
-                    if event_type.starts_with("parallel.completed") {
-                        return None;
+                } if !event_type.starts_with("parallel.completed") => {
+                    if let Some(role) = pending_human_roles.remove(from) {
+                        causal_events.push(ReplayInput::Human {
+                            state_id: from.clone(),
+                            role,
+                            event_type: event_type.clone(),
+                            payload: event_payload.clone(),
+                        });
+                    } else {
+                        causal_events.push(ReplayInput::External {
+                            event_type: event_type.clone(),
+                            payload: event_payload.clone(),
+                        });
                     }
-                    Some((event_type.clone(), event_payload.clone()))
-                } else {
-                    None
                 }
-            })
-            .collect();
+                _ => {}
+            }
+        }
 
         debug!(
             run = %run_id,
@@ -125,8 +136,19 @@ impl TraceReplayer {
             "replaying trace"
         );
 
-        for (event_type, payload) in causal_events {
-            instance.send(event_type, payload);
+        for input in causal_events {
+            match input {
+                ReplayInput::External {
+                    event_type,
+                    payload,
+                } => instance.send(event_type, payload),
+                ReplayInput::Human {
+                    state_id,
+                    role,
+                    event_type,
+                    payload,
+                } => instance.submit_human_input(state_id, role, event_type, payload)?,
+            }
         }
 
         // Step until done or 10 000 iterations.
@@ -145,6 +167,19 @@ impl TraceReplayer {
             events,
         })
     }
+}
+
+enum ReplayInput {
+    External {
+        event_type: String,
+        payload: serde_json::Value,
+    },
+    Human {
+        state_id: StateId,
+        role: String,
+        event_type: String,
+        payload: serde_json::Value,
+    },
 }
 
 /// The result of a [`TraceReplayer::replay`] call.
@@ -388,7 +423,12 @@ mod tests {
 
         let compiled = Arc::new(compile(doc).expect("compile"));
         let original = WorkflowSimulator::new(compiled.clone())
-            .inject("task.done", serde_json::json!({ "approved": true }))
+            .inject_human(
+                "work",
+                "operator",
+                "task.done",
+                serde_json::json!({ "approved": true }),
+            )
             .run()
             .await
             .expect("original run");

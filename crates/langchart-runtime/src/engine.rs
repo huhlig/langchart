@@ -47,6 +47,13 @@ enum RunCommand {
         payload: serde_json::Value,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
+    SubmitHumanInput {
+        state_id: StateId,
+        role: String,
+        event_type: String,
+        payload: serde_json::Value,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
     Suspend {
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
@@ -282,6 +289,31 @@ impl RuntimeEngine {
         self.send_cmd(
             run_id,
             RunCommand::SendBroadcast {
+                event_type: event_type.into(),
+                payload,
+                reply: reply_tx,
+            },
+        )?;
+        reply_rx
+            .await
+            .map_err(|_| EngineError::RunNotFound(run_id.clone()))?
+    }
+
+    /// Submit input to an active Human state as an identified caller role.
+    pub async fn submit_human_input(
+        &self,
+        run_id: &RunId,
+        state_id: StateId,
+        role: impl Into<String>,
+        event_type: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<(), EngineError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.send_cmd(
+            run_id,
+            RunCommand::SubmitHumanInput {
+                state_id,
+                role: role.into(),
                 event_type: event_type.into(),
                 payload,
                 reply: reply_tx,
@@ -544,6 +576,15 @@ async fn handle_run_command(instance: &mut WorkflowInstance, cmd: RunCommand) ->
             instance.send_broadcast(event_type, payload);
             let _ = reply.send(Ok(()));
         }
+        RunCommand::SubmitHumanInput {
+            state_id,
+            role,
+            event_type,
+            payload,
+            reply,
+        } => {
+            let _ = reply.send(instance.submit_human_input(state_id, role, event_type, payload));
+        }
         RunCommand::Suspend { reply } => {
             let _ = reply.send(instance.suspend().await);
         }
@@ -571,6 +612,9 @@ fn reply_error(cmd: RunCommand, error: EngineError) {
             let _ = reply.send(Err(error));
         }
         RunCommand::SendBroadcast { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        RunCommand::SubmitHumanInput { reply, .. } => {
             let _ = reply.send(Err(error));
         }
         RunCommand::Suspend { reply } => {
@@ -616,6 +660,12 @@ pub enum EngineError {
 
     #[error("run is cancelled")]
     Cancelled,
+
+    #[error("human state `{0}` is not active")]
+    HumanStateNotActive(StateId),
+
+    #[error("role `{role}` is not authorized for human state `{state_id}`")]
+    HumanRoleNotAuthorized { state_id: StateId, role: String },
 }
 
 impl From<langchart_adapters::broker::BrokerError> for EngineError {
