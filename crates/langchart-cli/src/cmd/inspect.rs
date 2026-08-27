@@ -73,3 +73,51 @@ pub async fn execute(args: InspectArgs) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use langchart_adapters::checkpoint::RunSnapshot;
+    use langchart_model::id::{CheckpointId, StateId};
+    use langchart_runtime::run::RunStatus;
+    use std::collections::{HashMap, VecDeque};
+
+    #[tokio::test]
+    async fn stored_instance_checkpoint_is_inspectable() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("checkpoints.redb");
+        let run_id = RunId::new("run-inspect");
+        let checkpoint = InstanceCheckpoint {
+            run_id: run_id.clone(),
+            workflow_id: "cli-test".into(),
+            workflow_version: "1.0.0".into(),
+            status: RunStatus::Suspended,
+            active_states: vec![StateId::new("waiting")],
+            workflow_data: None,
+            event_queue: VecDeque::new(),
+            queued_activity_invocations: HashMap::new(),
+            history: HashMap::new(),
+            attempt_counts: HashMap::new(),
+            parallel_regions_done: HashMap::new(),
+            pending_timers: Vec::new(),
+        };
+        let store = RedbCheckpointStore::open(&database_path).unwrap();
+        store
+            .save(&RunSnapshot {
+                run_id,
+                checkpoint_id: CheckpointId::new("checkpoint-1"),
+                payload: serde_json::to_vec(&checkpoint).unwrap(),
+            })
+            .await
+            .unwrap();
+        drop(store);
+
+        let result = execute(InspectArgs {
+            checkpoint_db: database_path,
+            run_id: "run-inspect".into(),
+        })
+        .await;
+
+        assert!(result.is_ok(), "inspect command failed: {result:?}");
+    }
+}

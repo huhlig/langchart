@@ -56,3 +56,36 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::test_support::{SIMPLE_WORKFLOW, write_json};
+    use langchart_adapters::event::RuntimeEventPayload;
+    use langchart_model::id::{EventId, RunId, StateId};
+
+    #[tokio::test]
+    async fn causal_transition_trace_replays_to_completion() {
+        let workflow = write_json(SIMPLE_WORKFLOW);
+        let trace = vec![RuntimeEvent {
+            event_id: EventId::new("event-1"),
+            run_id: RunId::new("run-1"),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            payload: RuntimeEventPayload::TransitionSelected {
+                from: StateId::new("start"),
+                to: StateId::new("done"),
+                event_type: "go".into(),
+                event_payload: serde_json::json!({ "source": "trace" }),
+            },
+        }];
+        let trace = write_json(&serde_json::to_string(&trace).unwrap());
+
+        let result = execute(ReplayArgs {
+            workflow: workflow.path().to_owned(),
+            trace: trace.path().to_owned(),
+        })
+        .await;
+
+        assert!(result.is_ok(), "replay command failed: {result:?}");
+    }
+}

@@ -138,3 +138,23 @@ fn parse_event_spec(s: &str) -> Result<(String, serde_json::Value), String> {
         None => Ok((s.to_owned(), serde_json::Value::Null)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::test_support::{SIMPLE_WORKFLOW, write_json};
+
+    #[tokio::test]
+    async fn injected_event_completes_pure_transition_workflow() {
+        let workflow = write_json(SIMPLE_WORKFLOW);
+        let result = execute(RunArgs {
+            workflow: workflow.path().to_owned(),
+            actors: Vec::new(),
+            inject: vec![("go".into(), serde_json::json!({ "source": "test" }))],
+            step_limit: 10,
+        })
+        .await;
+
+        assert!(result.is_ok(), "run command failed: {result:?}");
+    }
+}
