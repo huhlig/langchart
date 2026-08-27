@@ -250,6 +250,28 @@ fn validate_state(state: &StateDefinition, all_ids: &HashSet<String>, diags: &mu
                 ));
             }
         }
+        StateType::Human => {
+            if state.authorized_roles.is_empty() {
+                diags.push(Diagnostic::error(
+                    "E050",
+                    format!("Human state `{}` has no authorized roles", state.id),
+                    DiagnosticLocation::State {
+                        id: state.id.clone(),
+                    },
+                ));
+            }
+        }
+        StateType::Final => {
+            if !state.on.is_empty() {
+                diags.push(Diagnostic::error(
+                    "E060",
+                    format!("Final state `{}` has outbound transitions", state.id),
+                    DiagnosticLocation::State {
+                        id: state.id.clone(),
+                    },
+                ));
+            }
+        }
         _ if state.capabilities.as_ref().map(|c| c.elevate) == Some(true) => {
             diags.push(Diagnostic::warning(
                 "W050",
@@ -563,6 +585,22 @@ mod tests {
     fn compile_succeeds_on_valid_doc() {
         let doc = minimal_atomic_doc();
         assert!(compile(doc).is_ok());
+    }
+
+    #[test]
+    fn human_state_without_authorized_roles_is_an_error() {
+        let mut doc = minimal_atomic_doc();
+        doc.states[0].state_type = StateType::Human;
+        let diags = validate(&doc);
+        assert!(diags.iter().any(|d| d.code == "E050"));
+    }
+
+    #[test]
+    fn final_state_with_outbound_transition_is_an_error() {
+        let mut doc = minimal_atomic_doc();
+        doc.states[1].on = doc.states[0].on.clone();
+        let diags = validate(&doc);
+        assert!(diags.iter().any(|d| d.code == "E060"));
     }
 
     #[test]
