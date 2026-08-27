@@ -78,6 +78,10 @@ pub struct InstanceCheckpoint {
     pub workflow_version: String,
     pub status: RunStatus,
     pub active_states: Vec<StateId>,
+    /// Run-scoped workflow data used by guards and input bindings.
+    /// Defaults to absent when loading checkpoints written by older versions.
+    #[serde(default)]
+    pub workflow_data: Option<ron::Value>,
     /// Events acknowledged by the runtime but not yet processed by the RTC loop.
     #[serde(default)]
     pub event_queue: VecDeque<QueuedEvent>,
@@ -386,6 +390,7 @@ impl WorkflowInstance {
             workflow_version: self.workflow.document.version.0.clone(),
             status: self.status.clone(),
             active_states: self.active_states.clone(),
+            workflow_data: self.workflow_data.clone(),
             event_queue: self.event_queue.clone(),
             queued_activity_invocations: self.queued_activity_invocations.clone(),
             history: self.history.clone(),
@@ -1550,6 +1555,7 @@ impl WorkflowInstance {
     pub fn restore_from_checkpoint(&mut self, ck: &InstanceCheckpoint) {
         use langchart_model::id::RegionId;
         self.active_states = ck.active_states.clone();
+        self.workflow_data = ck.workflow_data.clone();
         self.event_queue = ck.event_queue.clone();
         self.queued_activity_invocations = ck.queued_activity_invocations.clone();
         self.history = ck.history.clone();

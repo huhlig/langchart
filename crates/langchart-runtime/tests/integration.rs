@@ -2662,6 +2662,89 @@ async fn checkpoint_save_and_restore() {
 }
 
 #[tokio::test]
+async fn checkpoint_preserves_workflow_data_used_by_guards() {
+    use langchart_runtime::run::InstanceCheckpoint;
+
+    let mut decision = leaf_state("decision", StateType::Atomic);
+    decision.on.insert(
+        "decide".into(),
+        vec![
+            TransitionSpec {
+                target: "approved".into(),
+                guard: Some("data.approved == true".into()),
+                priority: 0,
+                actions: vec![],
+                kind: Default::default(),
+            },
+            TransitionSpec {
+                target: "rejected".into(),
+                guard: Some("data.approved == false".into()),
+                priority: 1,
+                actions: vec![],
+                kind: Default::default(),
+            },
+        ],
+    );
+    let mut document = base_doc(
+        "wf-checkpoint-data",
+        vec![
+            decision,
+            leaf_state("approved", StateType::Final),
+            leaf_state("rejected", StateType::Final),
+        ],
+        "decision",
+    );
+    document
+        .data_schema
+        .fields
+        .insert("approved".into(), "bool".into());
+    let compiled = Arc::new(compile(document).expect("compile"));
+    let sink = Arc::new(VecSink::default());
+    let mut original = WorkflowInstance::new(
+        RunId::new("r-checkpoint-data"),
+        compiled.clone(),
+        bare_broker(sink.clone()),
+        sink,
+        HashMap::new(),
+    )
+    .with_workflow_data(ron::from_str(r#"{"approved": true}"#).expect("workflow data"));
+    original.start().await.expect("start original");
+
+    let encoded = serde_json::to_vec(&original.take_checkpoint()).expect("serialize checkpoint");
+    let checkpoint: InstanceCheckpoint =
+        serde_json::from_slice(&encoded).expect("deserialize checkpoint");
+    assert!(checkpoint.workflow_data.is_some());
+    let mut legacy_json: serde_json::Value =
+        serde_json::from_slice(&encoded).expect("checkpoint JSON");
+    legacy_json
+        .as_object_mut()
+        .expect("checkpoint object")
+        .remove("workflow_data");
+    let legacy: InstanceCheckpoint =
+        serde_json::from_value(legacy_json).expect("legacy checkpoint without workflow data");
+    assert_eq!(legacy.workflow_data, None);
+
+    let restored_sink = Arc::new(VecSink::default());
+    let mut restored = WorkflowInstance::new(
+        RunId::new("r-checkpoint-data"),
+        compiled,
+        bare_broker(restored_sink.clone()),
+        restored_sink.clone(),
+        HashMap::new(),
+    );
+    restored.restore_from_checkpoint(&checkpoint);
+    restored.send("decide", serde_json::Value::Null);
+    assert_eq!(
+        restored.run_to_completion().await.expect("run"),
+        RunStatus::Completed
+    );
+
+    assert!(restored_sink.payloads().await.iter().any(
+        |payload| matches!(payload, RuntimeEventPayload::TransitionSelected { to, .. } if to.0 == "approved")
+    ));
+}
+
+#[tokio::test]
 async fn checkpoint_preserves_queued_activity_completion_and_ownership() {
     use langchart_runtime::run::InstanceCheckpoint;
     use std::sync::atomic::{AtomicUsize, Ordering};
