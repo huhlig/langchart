@@ -2680,6 +2680,102 @@ async fn context_resolver_chain_populates_invocation() {
 }
 
 #[tokio::test]
+async fn deployment_and_ancestor_capabilities_restrict_agent_state() {
+    use langchart_model::policy::{CapabilityPolicy, OperationClass};
+
+    struct PolicyCapturingActor {
+        captured: Arc<Mutex<Option<CapabilityPolicy>>>,
+    }
+
+    #[async_trait]
+    impl AgentActor for PolicyCapturingActor {
+        async fn run(
+            &self,
+            _inv: langchart_runtime::instance::AgentInvocation,
+            env: langchart_runtime::broker::CapabilityEnvelope,
+            _broker: Arc<CapabilityBroker>,
+        ) -> Result<
+            langchart_runtime::instance::AgentOutputEvent,
+            langchart_runtime::instance::AgentError,
+        > {
+            *self.captured.lock().await = Some(env.policy().clone());
+            Ok(langchart_runtime::instance::AgentOutputEvent {
+                event_type: "work.done".into(),
+                payload: serde_json::Value::Null,
+            })
+        }
+    }
+
+    let allow = CapabilityPolicy {
+        artifact_operations: vec![OperationClass::Read],
+        memory_write: true,
+        ..Default::default()
+    };
+    let mut work = agentic_state("work", "work.done", "end");
+    work.capabilities = Some(allow.clone());
+
+    let mut parent = leaf_state("parent", StateType::Compound);
+    parent.initial = Some(StateId::new("work"));
+    parent.states = vec![work, leaf_state("end", StateType::Final)];
+    parent.capabilities = Some(CapabilityPolicy {
+        artifact_operations: vec![OperationClass::Read],
+        memory_write: false,
+        ..Default::default()
+    });
+
+    let mut doc = base_doc("capability-hierarchy", vec![parent], "parent");
+    doc.policy.max_capabilities = allow.clone();
+    doc.agents = vec![AgentDefinition {
+        id: AgentId::new("test-agent"),
+        version: AgentVersion::new("0.1.0"),
+        description: "test".into(),
+        system_prompt: "test".into(),
+        model_policy: ModelPolicy::default(),
+        default_context_policy: Default::default(),
+        default_capabilities: allow,
+        output_events: vec!["work.done".into()],
+    }];
+
+    let captured = Arc::new(Mutex::new(None));
+    let actor: Arc<dyn AgentActor> = Arc::new(PolicyCapturingActor {
+        captured: captured.clone(),
+    });
+    let sink = Arc::new(VecSink::default());
+    let broker = bare_broker(sink.clone());
+    let mut instance = WorkflowInstance::new(
+        RunId::new("r-capability-hierarchy"),
+        Arc::new(compile(doc).expect("compile")),
+        broker,
+        sink,
+        HashMap::from([(StateId::new("work"), actor)]),
+    )
+    .with_deployment_capabilities(CapabilityPolicy {
+        artifact_operations: vec![],
+        memory_write: true,
+        ..Default::default()
+    });
+
+    instance.start().await.expect("start");
+    for _ in 0..50 {
+        instance.step().await.expect("step");
+        if captured.lock().await.is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let effective = captured.lock().await.clone().expect("actor was invoked");
+    assert!(
+        !effective.memory_write,
+        "the parent state must be able to restrict memory writes"
+    );
+    assert!(
+        effective.artifact_operations.is_empty(),
+        "the deployment ceiling must be able to restrict artifact operations"
+    );
+}
+
+#[tokio::test]
 async fn configured_unhandled_events_fail_the_run() {
     let mut doc = base_doc(
         "wf-unhandled-fails",

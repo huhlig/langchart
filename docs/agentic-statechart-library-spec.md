@@ -650,13 +650,14 @@ Effective state capabilities are calculated by composing layers from outermost t
 
 1. deployment policy (host application global policy);
 2. workflow policy;
-3. parent-state policy (inherited, never widened without `elevate: true`);
+3. each parent-state policy, from outermost to innermost;
 4. agent definition defaults;
-5. state-specific restrictions or elevations;
-6. run-specific authorization (e.g., human-granted temporary permission).
+5. state-specific restrictions.
 
-The effective set is the **intersection** of allowed capabilities at each layer, except where an explicit
-authorized elevation is declared.
+The effective set is the **intersection** of allowed capabilities at every present layer. An omitted
+deployment or parent-state policy adds no restriction; a present empty policy denies all capabilities.
+`elevate: true` is currently a validation signal only and never widens runtime authority. Authorized
+elevation and run-specific temporary grants require a separate host authorizer and are not implemented.
 
 ### 10.2 MCP Exposure
 

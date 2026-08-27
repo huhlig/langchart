@@ -184,8 +184,8 @@ pub struct RedactionPolicy {
 
 // ── Capability policy ─────────────────────────────────────────────────────────
 
-/// The set of permissions granted to a state or agent.
-/// Effective capabilities are computed as the intersection of all policy layers.
+/// The set of permissions granted to a deployment, workflow, state, or agent.
+/// Effective capabilities are computed as the intersection of all present policy layers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapabilityPolicy {
     /// Per-MCP-server tool and resource allowlists.

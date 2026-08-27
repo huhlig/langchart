@@ -385,6 +385,23 @@ Stages run in order. Each adds items to a `ContextAccumulator`. `TruncationResol
 
 ---
 
+## Capability Resolution
+
+Configure an optional deployment-wide ceiling on the engine:
+
+```rust
+let engine = RuntimeEngine::new(adapters)
+    .with_deployment_capabilities(deployment_policy);
+```
+
+For each agent invocation, the runtime intersects the deployment ceiling (when
+present), workflow maximum, every ancestor-state policy, agent defaults, and the
+state policy. An omitted deployment or ancestor policy adds no restriction; a
+present empty policy denies all capabilities. `elevate: true` is diagnostic only
+and does not widen authority.
+
+---
+
 ## Artifacts
 
 The `ArtifactStore` trait manages versioned, proposal-based artifacts. Use `langchart-artifact-fs` for a quick file-system store:

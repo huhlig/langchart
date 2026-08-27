@@ -241,6 +241,9 @@ pub struct WorkflowInstance {
     broker: Arc<CapabilityBroker>,
     event_sink: Arc<dyn EventSink>,
 
+    // Optional deployment-wide ceiling applied before workflow capabilities.
+    deployment_capabilities: Option<CapabilityPolicy>,
+
     // Per-state agent actor registry.
     actors: HashMap<StateId, Arc<dyn AgentActor>>,
 
@@ -337,6 +340,7 @@ impl WorkflowInstance {
             outbox: Outbox::new(),
             broker,
             event_sink,
+            deployment_capabilities: None,
             actors,
             action_registry,
             parallel_regions_done: HashMap::new(),
@@ -361,6 +365,12 @@ impl WorkflowInstance {
     /// view instead of an empty placeholder.
     pub fn with_context_resolver(mut self, resolver: Arc<dyn ContextResolver>) -> Self {
         self.context_resolver = Some(resolver);
+        self
+    }
+
+    /// Apply a deployment-wide capability ceiling to this run.
+    pub fn with_deployment_capabilities(mut self, policy: CapabilityPolicy) -> Self {
+        self.deployment_capabilities = Some(policy);
         self
     }
 
@@ -1836,6 +1846,7 @@ impl WorkflowInstance {
         let parent_run_id = self.run_id.clone();
         let repo = self.workflow_repo.clone();
         let actors = self.actors.clone();
+        let deployment_capabilities = self.deployment_capabilities.clone();
         let iid = invocation_id;
 
         let handle = tokio::spawn(async move {
@@ -1871,6 +1882,9 @@ impl WorkflowInstance {
                 event_sink,
                 actors,
             );
+            if let Some(policy) = deployment_capabilities {
+                child = child.with_deployment_capabilities(policy);
+            }
             let input_json = child_input
                 .as_ref()
                 .and_then(|input| serde_json::to_value(input).ok())
@@ -2385,18 +2399,35 @@ impl WorkflowInstance {
 
     fn effective_capability_policy(&self, state_id: &StateId) -> CapabilityPolicy {
         let workflow_max = &self.workflow.document.policy.max_capabilities;
+        let mut effective = match &self.deployment_capabilities {
+            Some(deployment_max) => intersect_capability_policies(deployment_max, workflow_max),
+            None => workflow_max.clone(),
+        };
+
+        for ancestor_id in find_ancestor_chain(&self.workflow.document.states, state_id)
+            .into_iter()
+            .rev()
+        {
+            if let Some(ancestor_policy) = self
+                .find_state_def(&ancestor_id)
+                .and_then(|state| state.capabilities.as_ref())
+            {
+                effective = intersect_capability_policies(&effective, ancestor_policy);
+            }
+        }
+
         let agent_default = self
             .agent_def_for_state(state_id)
             .map(|agent| &agent.default_capabilities)
             .cloned()
             .unwrap_or_default();
-        let inherited = intersect_capability_policies(workflow_max, &agent_default);
+        effective = intersect_capability_policies(&effective, &agent_default);
         match self
             .find_state_def(state_id)
             .and_then(|state| state.capabilities.as_ref())
         {
-            Some(state_policy) => intersect_capability_policies(&inherited, state_policy),
-            None => inherited,
+            Some(state_policy) => intersect_capability_policies(&effective, state_policy),
+            None => effective,
         }
     }
 

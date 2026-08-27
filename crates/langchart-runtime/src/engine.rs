@@ -22,6 +22,7 @@ use langchart_adapters::{
 };
 use langchart_model::{
     id::{RunId, StateId},
+    policy::CapabilityPolicy,
     validation::compile,
     workflow::WorkflowDocument,
 };
@@ -112,6 +113,8 @@ pub struct RuntimeEngine {
     event_source: Option<Arc<dyn EventSource>>,
     /// Optional context resolver shared by runs created by this engine.
     context_resolver: Option<Arc<dyn ContextResolver>>,
+    /// Optional deployment-wide capability ceiling shared by all runs.
+    deployment_capabilities: Option<CapabilityPolicy>,
     /// Live run handles: run_id → command sender.
     runs: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<RunCommand>>>>,
 }
@@ -144,6 +147,7 @@ impl RuntimeEngine {
             workflow_repo: adapters.workflow_repo,
             event_source: adapters.event_source,
             context_resolver: None,
+            deployment_capabilities: None,
             runs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -151,6 +155,12 @@ impl RuntimeEngine {
     /// Configure context resolution for every run created or recovered by this engine.
     pub fn with_context_resolver(mut self, resolver: Arc<dyn ContextResolver>) -> Self {
         self.context_resolver = Some(resolver);
+        self
+    }
+
+    /// Configure a deployment-wide capability ceiling for every run.
+    pub fn with_deployment_capabilities(mut self, policy: CapabilityPolicy) -> Self {
+        self.deployment_capabilities = Some(policy);
         self
     }
 
@@ -203,6 +213,9 @@ impl RuntimeEngine {
         }
         if let Some(resolver) = &self.context_resolver {
             instance = instance.with_context_resolver(resolver.clone());
+        }
+        if let Some(policy) = &self.deployment_capabilities {
+            instance = instance.with_deployment_capabilities(policy.clone());
         }
         if let Some(data) = workflow_data {
             instance = instance.with_workflow_data(data);
@@ -367,6 +380,9 @@ impl RuntimeEngine {
         }
         if let Some(resolver) = &self.context_resolver {
             instance = instance.with_context_resolver(resolver.clone());
+        }
+        if let Some(policy) = &self.deployment_capabilities {
+            instance = instance.with_deployment_capabilities(policy.clone());
         }
 
         // Restore mutable state from the checkpoint.
