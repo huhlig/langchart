@@ -295,6 +295,12 @@ impl RedactingEventSink {
                     *tool_name = "[REDACTED]".into();
                 }
             }
+            RuntimeEventPayload::ToolResponse { .. } => {
+                // ToolResponse records metadata only; raw tool results never
+                // cross the event-sink boundary. Keep the policy read here so
+                // adding result content to the schema cannot silently bypass it.
+                let _ = self.policy.redact_tool_results;
+            }
             RuntimeEventPayload::MemorySearched { query_preview } => {
                 if self.policy.redact_memory_queries {
                     *query_preview = "[REDACTED]".into();

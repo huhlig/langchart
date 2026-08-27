@@ -210,14 +210,19 @@ impl RuntimeEngine {
         instance.start().await?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        self.runs.lock().unwrap().insert(run_id.0.clone(), cmd_tx);
+        self.runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run_id.0.clone(), cmd_tx);
 
         // Spawn the run task.
         let runs = self.runs.clone();
         let rid = run_id.clone();
         tokio::spawn(async move {
             run_task(instance, cmd_rx).await;
-            runs.lock().unwrap().remove(&rid.0);
+            runs.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&rid.0);
         });
 
         Ok(run_id)
@@ -380,14 +385,16 @@ impl RuntimeEngine {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         self.runs
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(restored_run_id.0.clone(), cmd_tx);
 
         let runs = self.runs.clone();
         let rid = restored_run_id.clone();
         tokio::spawn(async move {
             run_task(instance, cmd_rx).await;
-            runs.lock().unwrap().remove(&rid.0);
+            runs.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&rid.0);
         });
 
         Ok(restored_run_id)
@@ -419,7 +426,10 @@ impl RuntimeEngine {
     // ── Internals ─────────────────────────────────────────────────────────────
 
     fn send_cmd(&self, run_id: &RunId, cmd: RunCommand) -> Result<(), EngineError> {
-        let runs = self.runs.lock().unwrap();
+        let runs = self
+            .runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tx = runs
             .get(&run_id.0)
             .ok_or_else(|| EngineError::RunNotFound(run_id.clone()))?;

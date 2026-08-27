@@ -142,6 +142,17 @@ impl TimerRegistry {
         debug!(timer = %id.0, "timer cancelled");
     }
 
+    /// Consume a fired timer if it is still active.
+    ///
+    /// A timer task may enqueue its notification immediately before the owning
+    /// state cancels it. Keeping the registry entry until event processing lets
+    /// the runtime reject that stale notification after cancellation.
+    pub fn consume_fired(&mut self, id: &TimerId) -> Option<TimerEntry> {
+        self.handles.remove(id);
+        self.fire_at.remove(id);
+        self.entries.remove(id)
+    }
+
     /// Returns all pending timer entries for checkpoint persistence.
     ///
     /// Each entry's `remaining_ms` reflects the time left from *now* (using

@@ -651,6 +651,22 @@ impl WorkflowInstance {
             self.queued_activity_invocations.remove(state_id);
         }
 
+        if let EventSource::Timer { timer_id } = &event.source {
+            let Some(entry) = self.timers.consume_fired(timer_id) else {
+                debug!(run = %self.run_id, timer = %timer_id.0, "ignoring cancelled timer event");
+                return Ok(());
+            };
+            if !self.active_states.contains(&entry.state_id) {
+                debug!(
+                    run = %self.run_id,
+                    timer = %timer_id.0,
+                    state = %entry.state_id,
+                    "ignoring timer event for inactive state"
+                );
+                return Ok(());
+            }
+        }
+
         // Handle parallel.completed synthetic event specially.
         if event.event_type.starts_with("parallel.completed:") {
             let parallel_id_str = &event.event_type["parallel.completed:".len()..];
@@ -789,9 +805,8 @@ impl WorkflowInstance {
         // fire one transition. At the root level, only the highest-priority
         // transition fires.
         //
-        // Since active_states is ordered, and parallel region states appear
-        // after their parallel parent (which is NOT itself in active_states),
-        // we can group them by checking region membership.
+        // Since active_states is ordered, parallel region states appear after
+        // their active parallel parent. We group them by region membership.
 
         // Build a map: active_state → (region_of_parallel_parent, or None)
         let region_groups = self.group_active_states_by_region();
@@ -803,7 +818,9 @@ impl WorkflowInstance {
         if let Some(root_states) = region_groups.get(&None)
             && let Some(t) = self.best_transition_from(root_states, event)
         {
-            result.push(t);
+            // A transition selected at the root configuration exits the whole
+            // parallel state and therefore preempts region-local transitions.
+            return vec![t];
         }
 
         // parallel region groups
@@ -1136,7 +1153,8 @@ impl WorkflowInstance {
 
     async fn enter_parallel_state(&mut self, parallel_id: &StateId) -> Result<(), EngineError> {
         debug!(run = %self.run_id, state = %parallel_id, "entering parallel state");
-        // Parallel state itself is NOT added to active_states — its regions are.
+        self.run_on_entry_actions(parallel_id).await?;
+        self.active_states.push(parallel_id.clone());
         self.emit(RuntimeEventPayload::StateEntered {
             state_id: parallel_id.clone(),
         })
@@ -1262,32 +1280,7 @@ impl WorkflowInstance {
         })
         .await?;
 
-        // Collect all active states that belong to regions of this parallel.
-        let region_states: Vec<StateId> = self
-            .active_states
-            .iter()
-            .filter(|s| {
-                self.find_parallel_region_key(s)
-                    .map(|(pid, _)| &pid == parallel_id)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-
-        // Exit region states (inner to outer).
-        for s in region_states {
-            self.exit_state_silent(&s).await?;
-        }
-
-        // Clean up completion tracking.
-        self.parallel_regions_done.remove(parallel_id);
-
-        // Run lifecycle hooks and emit StateExited for the parallel state itself.
-        self.run_on_exit_actions(parallel_id).await?;
-        self.emit(RuntimeEventPayload::StateExited {
-            state_id: parallel_id.clone(),
-        })
-        .await?;
+        self.exit_parallel_configuration(parallel_id).await?;
 
         // If the parallel state has a `parallel.completed` transition, fire it.
         // Otherwise check if parallel state was the root and complete the run.
@@ -1328,6 +1321,40 @@ impl WorkflowInstance {
         Ok(())
     }
 
+    async fn exit_parallel_configuration(
+        &mut self,
+        parallel_id: &StateId,
+    ) -> Result<(), EngineError> {
+        // Collect all active states that belong to regions of this parallel.
+        let region_states: Vec<StateId> = self
+            .active_states
+            .iter()
+            .filter(|s| {
+                self.find_parallel_region_key(s)
+                    .map(|(pid, _)| &pid == parallel_id)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+
+        // Exit region states (inner to outer).
+        for s in region_states {
+            self.exit_state_silent(&s).await?;
+        }
+
+        // Clean up completion tracking.
+        self.parallel_regions_done.remove(parallel_id);
+        self.active_states.retain(|state| state != parallel_id);
+
+        // Run lifecycle hooks and emit StateExited for the parallel state itself.
+        self.run_on_exit_actions(parallel_id).await?;
+        self.emit(RuntimeEventPayload::StateExited {
+            state_id: parallel_id.clone(),
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Exit a state without doing completion-checking side-effects (used when
     /// bulk-exiting parallel region states).
     async fn exit_state_silent(&mut self, state_id: &StateId) -> Result<(), EngineError> {
@@ -1357,6 +1384,13 @@ impl WorkflowInstance {
 
     async fn exit_state(&mut self, state_id: &StateId) -> Result<(), EngineError> {
         debug!(run = %self.run_id, state = %state_id, "exiting state");
+
+        if self
+            .find_state_def(state_id)
+            .is_some_and(|state| state.state_type == StateType::Parallel)
+        {
+            return self.exit_parallel_configuration(state_id).await;
+        }
 
         // Save history on the exiting state itself (no-op if it has no history mode).
         self.save_history(state_id);

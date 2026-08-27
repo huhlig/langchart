@@ -898,6 +898,69 @@ async fn parallel_any_completion() {
     );
 }
 
+#[tokio::test]
+async fn event_bubbles_once_to_active_parallel_parent() {
+    use langchart_model::{
+        id::RegionId,
+        state::{ParallelCompletion, ParallelRegion},
+    };
+
+    let mut parallel = leaf_state("parallel", StateType::Parallel);
+    parallel.completion = Some(ParallelCompletion::All);
+    parallel.regions = vec![
+        ParallelRegion {
+            id: RegionId::new("left"),
+            name: "Left".into(),
+            initial: StateId::new("left_work"),
+            states: vec![leaf_state("left_work", StateType::Atomic)],
+        },
+        ParallelRegion {
+            id: RegionId::new("right"),
+            name: "Right".into(),
+            initial: StateId::new("right_work"),
+            states: vec![leaf_state("right_work", StateType::Atomic)],
+        },
+    ];
+    parallel = with_transition(parallel, "abort", "done", None);
+
+    let compiled = Arc::new(
+        compile(base_doc(
+            "parallel-parent-bubbling",
+            vec![parallel, leaf_state("done", StateType::Final)],
+            "parallel",
+        ))
+        .expect("compile"),
+    );
+    let sink = Arc::new(VecSink::default());
+    let mut instance = WorkflowInstance::new(
+        RunId::new("r-parallel-parent-bubbling"),
+        compiled,
+        bare_broker(sink.clone()),
+        sink.clone(),
+        HashMap::new(),
+    );
+    instance.start().await.expect("start");
+
+    assert!(instance.active_states.contains(&StateId::new("parallel")));
+    instance.send("abort", serde_json::Value::Null);
+    assert!(instance.step().await.expect("process abort"));
+
+    assert_eq!(instance.active_states, vec![StateId::new("done")]);
+    let selected = sink
+        .payloads()
+        .await
+        .into_iter()
+        .filter(|payload| {
+            matches!(
+                payload,
+                RuntimeEventPayload::TransitionSelected { from, event_type, .. }
+                    if from.0 == "parallel" && event_type == "abort"
+            )
+        })
+        .count();
+    assert_eq!(selected, 1, "parallel parent transition must fire once");
+}
+
 /// 9. Subworkflow stub: emits `SubworkflowFailed` and the workflow
 ///    handles it via `subworkflow.failed` transition.
 #[tokio::test]
@@ -3779,6 +3842,55 @@ async fn timer_survives_checkpoint_and_fires_after_recovery() {
         routed,
         "TransitionSelected for timer.fired → end must be present"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_timer_notification_cannot_affect_next_state() {
+    use std::time::Duration;
+
+    let work = with_transition(
+        leaf_state("work", StateType::Atomic),
+        "leave",
+        "parked",
+        None,
+    );
+    let parked = with_transition(
+        leaf_state("parked", StateType::Atomic),
+        "timeout",
+        "bad",
+        None,
+    );
+    let compiled = Arc::new(
+        compile(base_doc(
+            "timer-cancel-race",
+            vec![work, parked, leaf_state("bad", StateType::Final)],
+            "work",
+        ))
+        .expect("compile"),
+    );
+    let sink = Arc::new(VecSink::default());
+    let mut instance = WorkflowInstance::new(
+        RunId::new("r-timer-cancel-race"),
+        compiled,
+        bare_broker(sink.clone()),
+        sink.clone(),
+        HashMap::new(),
+    );
+    instance.start().await.expect("start");
+    instance.schedule_timer(StateId::new("work"), "timeout", Duration::from_millis(10));
+
+    tokio::time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+    instance.send("leave", serde_json::Value::Null);
+
+    instance.step().await.expect("process leave");
+    instance.step().await.expect("discard stale timer");
+
+    assert_eq!(instance.status, RunStatus::Running);
+    assert!(instance.active_states.contains(&StateId::new("parked")));
+    assert!(!sink.payloads().await.iter().any(
+        |payload| matches!(payload, RuntimeEventPayload::TransitionSelected { to, .. } if to.0 == "bad")
+    ));
 }
 
 // ── F6: Agent output_events validation ───────────────────────────────────────

@@ -161,7 +161,9 @@ pub struct RedactionPolicy {
     #[serde(default)]
     pub redact_tool_arguments: bool,
 
-    /// Redact tool-call results on [`ToolResponse`] events.
+    /// Redact tool-call result content if it is added to [`ToolResponse`]
+    /// events in a future schema. Current events contain metadata only and
+    /// never persist raw tool results.
     #[serde(default)]
     pub redact_tool_results: bool,
 
