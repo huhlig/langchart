@@ -417,32 +417,24 @@ inputs are checked after the referenced workflow is resolved.
 
 ## 8. Transitions, Events, and Guards
 
-### 8.1 Event Envelope
+### 8.1 Transition Input
 
-Every runtime event MUST contain a stable envelope:
+An event submitted for transition selection consists of a run ID, event type, and JSON payload. The embedding API
+passes the run ID separately from the event type and payload:
 
-```json
-{
-  "event_id": "evt_01JXXX",
-  "event_type": "review.completed",
-  "workflow_id": "content-review",
-  "workflow_version": "2.1.0",
-  "run_id": "run_01JXXX",
-  "state_id": "review.continuity",
-  "timestamp": "2026-07-19T17:00:00Z",
-  "correlation_id": "inv_01JXXX",
-  "causation_id": "evt_00JXXX",
-  "payload": {},
-  "schema": "schemas/review-completed@1"
-}
+```rust
+engine.send(&run_id, "review.completed", serde_json::json!({})).await?;
 ```
 
-Events MUST be validated against their declared payload schema before they participate in transition selection.
-Invalid events are rejected with an observable error record; they do not silently fail.
+The runtime attaches an internal source classification (external, human, activity, timer, or internal) when it
+queues the event. Payload schemas are declared by the workflow rather than supplied by the caller. Events MUST be
+validated against the applicable declared schema before they participate in transition selection. Invalid events
+are rejected with an observable error record; they do not silently fail.
 
-**Event channels:** External events (from humans, integrations, timers) and internal events (from agent actors)
-flow through the same validated event channel. The event envelope's `correlation_id` and `causation_id` fields
-distinguish the causal chain.
+External events and internal events flow through the same transition-selection path. Human input additionally
+carries its target state and authenticated caller role as described below. This transition input is distinct from
+the observable `RuntimeEvent` record defined in §18; neither structure claims unsupported correlation or causation
+metadata.
 
 Human-state input is a distinct host submission carrying a target state ID and an authenticated caller role. The
 runtime MUST accept it only when the target Human state is active and the role appears in that state's
@@ -1253,6 +1245,23 @@ Guards are not evaluated in this mode (no live `WorkflowData`). Only guardless t
 ### 18.1 Observable Records
 
 Every significant runtime action MUST produce an observable `RuntimeEvent` record:
+
+```json
+{
+  "event_id": "evt_01JXXX",
+  "run_id": "run_01JXXX",
+  "timestamp": "2026-07-19T17:00:00Z",
+  "payload": {
+    "kind": "state_entered",
+    "state_id": "review.continuity"
+  }
+}
+```
+
+The stable record envelope contains `event_id`, `run_id`, `timestamp`, and a typed `payload`. Variant-specific
+fields, including `state_id`, live inside that payload and are present only when meaningful. Workflow identity and
+version are stored in the compiled workflow and checkpoints rather than repeated on every observable record.
+Correlation IDs, causation IDs, and per-event schema references are not part of the current `RuntimeEvent` contract.
 
 | Category | Events |
 |---|---|
