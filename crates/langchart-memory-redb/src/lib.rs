@@ -28,6 +28,13 @@ use ulid::Ulid;
 
 // Table: MemoryId (str) → JSON StoredRecord (str)
 const MEMORY: TableDefinition<&str, &str> = TableDefinition::new("memory");
+// Composite scope + MemoryId → MemoryId.
+const SCOPE_INDEX: TableDefinition<&str, &str> = TableDefinition::new("memory_scope_index");
+// Composite scope + logical key + MemoryId → MemoryId.
+const KEY_INDEX: TableDefinition<&str, &str> = TableDefinition::new("memory_key_index");
+const METADATA: TableDefinition<&str, &str> = TableDefinition::new("memory_metadata");
+const INDEX_VERSION_KEY: &str = "index_version";
+const INDEX_VERSION: &str = "1";
 
 // ── Internal record ───────────────────────────────────────────────────────────
 
@@ -51,12 +58,63 @@ impl RedbMemoryAdapter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let db = Database::create(path.as_ref()).map_err(|e| StoreError::Open(e.to_string()))?;
 
-        // Ensure table exists.
+        // Ensure tables exist and backfill indexes for databases created by
+        // versions that only had the primary memory table.
         let tx = db
             .begin_write()
             .map_err(|e| StoreError::Open(e.to_string()))?;
         tx.open_table(MEMORY)
             .map_err(|e| StoreError::Open(e.to_string()))?;
+        tx.open_table(SCOPE_INDEX)
+            .map_err(|e| StoreError::Open(e.to_string()))?;
+        tx.open_table(KEY_INDEX)
+            .map_err(|e| StoreError::Open(e.to_string()))?;
+        tx.open_table(METADATA)
+            .map_err(|e| StoreError::Open(e.to_string()))?;
+
+        let needs_backfill = {
+            let metadata = tx
+                .open_table(METADATA)
+                .map_err(|e| StoreError::Open(e.to_string()))?;
+            metadata
+                .get(INDEX_VERSION_KEY)
+                .map_err(|e| StoreError::Open(e.to_string()))?
+                .is_none_or(|version| version.value() != INDEX_VERSION)
+        };
+        if needs_backfill {
+            let memory = tx
+                .open_table(MEMORY)
+                .map_err(|e| StoreError::Open(e.to_string()))?;
+            let mut scope_index = tx
+                .open_table(SCOPE_INDEX)
+                .map_err(|e| StoreError::Open(e.to_string()))?;
+            let mut key_index = tx
+                .open_table(KEY_INDEX)
+                .map_err(|e| StoreError::Open(e.to_string()))?;
+            for entry in memory.iter().map_err(|e| StoreError::Open(e.to_string()))? {
+                let (_, value) = entry.map_err(|e| StoreError::Open(e.to_string()))?;
+                let Ok(stored) = serde_json::from_str::<StoredRecord>(value.value()) else {
+                    continue;
+                };
+                let scope = Self::scope_key(&stored.record.scope);
+                let scope_index_key = Self::scope_index_key(&scope, &stored.id);
+                scope_index
+                    .insert(scope_index_key.as_str(), stored.id.as_str())
+                    .map_err(|e| StoreError::Open(e.to_string()))?;
+                if let Some(key) = &stored.record.key {
+                    let key_index_key = Self::key_index_key(&scope, key, &stored.id);
+                    key_index
+                        .insert(key_index_key.as_str(), stored.id.as_str())
+                        .map_err(|e| StoreError::Open(e.to_string()))?;
+                }
+            }
+            let mut metadata = tx
+                .open_table(METADATA)
+                .map_err(|e| StoreError::Open(e.to_string()))?;
+            metadata
+                .insert(INDEX_VERSION_KEY, INDEX_VERSION)
+                .map_err(|e| StoreError::Open(e.to_string()))?;
+        }
         tx.commit().map_err(|e| StoreError::Open(e.to_string()))?;
 
         Ok(Self { db: Arc::new(db) })
@@ -69,6 +127,38 @@ impl RedbMemoryAdapter {
             MemoryScope::Agent(id) => format!("agent:{}", id.0),
             MemoryScope::Global => "global".into(),
         }
+    }
+
+    fn encode_index_part(value: &str) -> String {
+        format!("{}:{value}", value.len())
+    }
+
+    fn scope_index_prefix(scope: &str) -> String {
+        Self::encode_index_part(scope)
+    }
+
+    fn scope_index_key(scope: &str, id: &str) -> String {
+        format!(
+            "{}{}",
+            Self::scope_index_prefix(scope),
+            Self::encode_index_part(id)
+        )
+    }
+
+    fn key_index_prefix(scope: &str, key: &str) -> String {
+        format!(
+            "{}{}",
+            Self::encode_index_part(scope),
+            Self::encode_index_part(key)
+        )
+    }
+
+    fn key_index_key(scope: &str, key: &str, id: &str) -> String {
+        format!(
+            "{}{}",
+            Self::key_index_prefix(scope, key),
+            Self::encode_index_part(id)
+        )
     }
 }
 
@@ -84,6 +174,12 @@ pub enum StoreError {
 impl MemoryAdapter for RedbMemoryAdapter {
     async fn store(&self, record: MemoryRecord) -> Result<MemoryId, MemoryError> {
         let id = MemoryId(Ulid::generate().to_string());
+        let scope = Self::scope_key(&record.scope);
+        let scope_index_key = Self::scope_index_key(&scope, &id.0);
+        let key_index_key = record
+            .key
+            .as_deref()
+            .map(|key| Self::key_index_key(&scope, key, &id.0));
         let stored = StoredRecord {
             id: id.0.clone(),
             record,
@@ -104,6 +200,20 @@ impl MemoryAdapter for RedbMemoryAdapter {
                 table
                     .insert(stored_id.as_str(), value.as_str())
                     .map_err(|e| MemoryError::Store(e.to_string()))?;
+                let mut scope_index = tx
+                    .open_table(SCOPE_INDEX)
+                    .map_err(|e| MemoryError::Store(e.to_string()))?;
+                scope_index
+                    .insert(scope_index_key.as_str(), stored_id.as_str())
+                    .map_err(|e| MemoryError::Store(e.to_string()))?;
+                if let Some(key_index_key) = key_index_key {
+                    let mut key_index = tx
+                        .open_table(KEY_INDEX)
+                        .map_err(|e| MemoryError::Store(e.to_string()))?;
+                    key_index
+                        .insert(key_index_key.as_str(), stored_id.as_str())
+                        .map_err(|e| MemoryError::Store(e.to_string()))?;
+                }
             }
             tx.commit().map_err(|e| MemoryError::Store(e.to_string()))?;
             Ok(())
@@ -116,6 +226,9 @@ impl MemoryAdapter for RedbMemoryAdapter {
 
     async fn search(&self, query: MemoryQuery) -> Result<Vec<MemoryResult>, MemoryError> {
         let scope_prefix = Self::scope_key(&query.scope);
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
 
         // For Semantic queries, fall back to keyword with a warning.
         let search_text = match &query.mode {
@@ -139,22 +252,30 @@ impl MemoryAdapter for RedbMemoryAdapter {
             let table = tx
                 .open_table(MEMORY)
                 .map_err(|e| MemoryError::Store(e.to_string()))?;
+            let scope_index = tx
+                .open_table(SCOPE_INDEX)
+                .map_err(|e| MemoryError::Store(e.to_string()))?;
+            let index_prefix = Self::scope_index_prefix(&scope_prefix);
 
             let mut results = Vec::new();
-            for entry in table
-                .iter()
+            for entry in scope_index
+                .range(index_prefix.as_str()..)
                 .map_err(|e| MemoryError::Store(e.to_string()))?
             {
-                let (_, value_guard) = entry.map_err(|e| MemoryError::Store(e.to_string()))?;
+                let (index_key, id) = entry.map_err(|e| MemoryError::Store(e.to_string()))?;
+                if !index_key.value().starts_with(&index_prefix) {
+                    break;
+                }
+                let Some(value_guard) = table
+                    .get(id.value())
+                    .map_err(|e| MemoryError::Store(e.to_string()))?
+                else {
+                    continue;
+                };
                 let stored: StoredRecord = match serde_json::from_str(value_guard.value()) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-
-                // Filter by scope.
-                if Self::scope_key(&stored.record.scope) != scope_prefix {
-                    continue;
-                }
 
                 // Filter by text (substring match on content).
                 if let Some(ref text) = search_text
@@ -216,13 +337,29 @@ impl MemoryAdapter for RedbMemoryAdapter {
             let tx = db
                 .begin_write()
                 .map_err(|e| MemoryError::Store(e.to_string()))?;
-            {
+            let removed = {
                 let mut table = tx
                     .open_table(MEMORY)
                     .map_err(|e| MemoryError::Store(e.to_string()))?;
-                table
+                let removed = table
                     .remove(id.as_str())
                     .map_err(|e| MemoryError::Store(e.to_string()))?;
+                removed.and_then(|value| serde_json::from_str::<StoredRecord>(value.value()).ok())
+            };
+            if let Some(stored) = removed {
+                let scope = Self::scope_key(&stored.record.scope);
+                let scope_index_key = Self::scope_index_key(&scope, &stored.id);
+                tx.open_table(SCOPE_INDEX)
+                    .map_err(|e| MemoryError::Store(e.to_string()))?
+                    .remove(scope_index_key.as_str())
+                    .map_err(|e| MemoryError::Store(e.to_string()))?;
+                if let Some(key) = stored.record.key {
+                    let key_index_key = Self::key_index_key(&scope, &key, &stored.id);
+                    tx.open_table(KEY_INDEX)
+                        .map_err(|e| MemoryError::Store(e.to_string()))?
+                        .remove(key_index_key.as_str())
+                        .map_err(|e| MemoryError::Store(e.to_string()))?;
+                }
             }
             tx.commit().map_err(|e| MemoryError::Store(e.to_string()))?;
             Ok(())
@@ -250,29 +387,37 @@ impl RedbMemoryAdapter {
             let table = tx
                 .open_table(MEMORY)
                 .map_err(|e| MemoryError::Store(e.to_string()))?;
+            let key_index = tx
+                .open_table(KEY_INDEX)
+                .map_err(|e| MemoryError::Store(e.to_string()))?;
+            let index_prefix = Self::key_index_prefix(&scope_prefix, &key);
 
             let mut results = Vec::new();
-            for entry in table
-                .iter()
+            for entry in key_index
+                .range(index_prefix.as_str()..)
                 .map_err(|e| MemoryError::Store(e.to_string()))?
             {
-                let (_, value_guard) = entry.map_err(|e| MemoryError::Store(e.to_string()))?;
+                let (index_key, id) = entry.map_err(|e| MemoryError::Store(e.to_string()))?;
+                if !index_key.value().starts_with(&index_prefix) {
+                    break;
+                }
+                let Some(value_guard) = table
+                    .get(id.value())
+                    .map_err(|e| MemoryError::Store(e.to_string()))?
+                else {
+                    continue;
+                };
                 let stored: StoredRecord = match serde_json::from_str(value_guard.value()) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-                if Self::scope_key(&stored.record.scope) != scope_prefix {
-                    continue;
-                }
-                if stored.record.key.as_deref() == Some(key.as_str()) {
-                    results.push(MemoryResult {
-                        id: MemoryId(stored.id),
-                        record: stored.record,
-                        score: Some(1.0),
-                    });
-                    if results.len() >= limit as usize {
-                        break;
-                    }
+                results.push(MemoryResult {
+                    id: MemoryId(stored.id),
+                    record: stored.record,
+                    score: Some(1.0),
+                });
+                if results.len() >= limit as usize {
+                    break;
                 }
             }
             Ok(results)
@@ -426,6 +571,78 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].record.content, "Paris");
         assert_eq!(results[0].score, Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn opening_legacy_database_backfills_search_indexes() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let db = Database::create(tmp.path()).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut table = tx.open_table(MEMORY).unwrap();
+                let stored = StoredRecord {
+                    id: "legacy-id".into(),
+                    record: MemoryRecord {
+                        scope: run_scope(),
+                        key: Some("legacy-key".into()),
+                        content: "legacy content".into(),
+                        embedding: None,
+                        metadata: serde_json::Value::Null,
+                    },
+                };
+                let value = serde_json::to_string(&stored).unwrap();
+                table.insert("legacy-id", value.as_str()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let mem = RedbMemoryAdapter::open(tmp.path()).unwrap();
+        let results = mem
+            .search(MemoryQuery {
+                scope: run_scope(),
+                mode: QueryMode::Key {
+                    key: "legacy-key".into(),
+                },
+                limit: 10,
+                min_score: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, MemoryId("legacy-id".into()));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_secondary_index_entries() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mem = RedbMemoryAdapter::open(tmp.path()).unwrap();
+        let id = mem
+            .store(MemoryRecord {
+                scope: run_scope(),
+                key: Some("temporary-key".into()),
+                content: "temporary content".into(),
+                embedding: None,
+                metadata: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+
+        mem.delete(&id).await.unwrap();
+        let results = mem
+            .search(MemoryQuery {
+                scope: run_scope(),
+                mode: QueryMode::Key {
+                    key: "temporary-key".into(),
+                },
+                limit: 10,
+                min_score: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(results.is_empty());
     }
 
     #[tokio::test]

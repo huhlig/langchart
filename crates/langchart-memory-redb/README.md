@@ -21,8 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Notes
 
-- Memory entries are keyed by agent identity and a ULID timestamp.
-- The adapter supports write, query-by-relevance, and retrieval operations as defined by the `MemoryAdapter` trait.
+- Memory entries use ULID primary keys plus scope and exact-key indexes. Existing databases are indexed automatically
+  when first opened by a newer adapter.
+- Keyword queries scan only the requested scope; exact-key queries use the secondary index. Semantic queries fall back
+  to scoped keyword matching with a warning.
 - For multi-process or distributed deployments, use a shared memory backend instead of a local file.
 
 ## License
