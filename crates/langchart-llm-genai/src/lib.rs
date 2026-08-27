@@ -10,11 +10,16 @@ pub mod bridge;
 pub mod error;
 
 use async_trait::async_trait;
+use futures::{Stream, StreamExt, stream};
 use genai::{
     adapter::AdapterKind,
-    chat::{ChatOptions, ChatResponseFormat},
+    chat::{ChatOptions, ChatResponseFormat, ChatStreamEvent, MessageContent},
 };
-use langchart_adapters::llm::{LlmAdapter, LlmError, LlmRequest, LlmResponse, ResponseFormat};
+use langchart_adapters::llm::{
+    FinishReason, LlmAdapter, LlmError, LlmEventStream, LlmRequest, LlmResponse, LlmStreamEvent,
+    ResponseFormat, TokenUsage, ToolCall,
+};
+use std::collections::VecDeque;
 
 /// LLM adapter backed by the `genai` multi-provider client.
 pub struct GenaiLlmAdapter {
@@ -69,6 +74,160 @@ impl LlmAdapter for GenaiLlmAdapter {
             .await
             .map_err(error::map)?;
         Ok(bridge::from_genai_response(response))
+    }
+
+    async fn complete_stream(&self, request: LlmRequest) -> Result<LlmEventStream, LlmError> {
+        let model = request
+            .model_policy
+            .model
+            .as_deref()
+            .unwrap_or("gemini-2.0-flash");
+        let target = self
+            .client
+            .resolve_service_target(model)
+            .await
+            .map_err(error::map)?;
+        let mut options = chat_options(&request, target.model.adapter_kind)?;
+        options.capture_usage = Some(true);
+        options.capture_content = Some(true);
+        options.capture_reasoning_content = Some(true);
+        let chat_req = bridge::to_genai_request(&request);
+        let response = self
+            .client
+            .exec_chat_stream(model, chat_req, Some(&options))
+            .await
+            .map_err(error::map)?;
+        let resolved_model = response.model_iden.model_name.to_string();
+        Ok(normalize_stream(response.stream, resolved_model))
+    }
+}
+
+fn normalize_stream<S>(stream: S, model: String) -> LlmEventStream
+where
+    S: Stream<Item = genai::Result<ChatStreamEvent>> + Send + Unpin + 'static,
+{
+    struct State<S> {
+        stream: S,
+        queue: VecDeque<Result<LlmStreamEvent, LlmError>>,
+        model: String,
+        content: String,
+        reasoning: String,
+        done: bool,
+    }
+
+    let state = State {
+        stream,
+        queue: VecDeque::new(),
+        model,
+        content: String::new(),
+        reasoning: String::new(),
+        done: false,
+    };
+
+    Box::pin(stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.queue.pop_front() {
+                return Some((event, state));
+            }
+            if state.done {
+                return None;
+            }
+
+            match state.stream.next().await {
+                Some(Ok(ChatStreamEvent::Start)) => {
+                    state.queue.push_back(Ok(LlmStreamEvent::ResponseStarted {
+                        request_id: None,
+                        reported_model: None,
+                    }));
+                }
+                Some(Ok(ChatStreamEvent::Chunk(chunk))) => {
+                    state.content.push_str(&chunk.content);
+                    state.queue.push_back(Ok(LlmStreamEvent::TextDelta {
+                        delta: chunk.content,
+                    }));
+                }
+                Some(Ok(ChatStreamEvent::ReasoningChunk(chunk))) => {
+                    state.reasoning.push_str(&chunk.content);
+                    state.queue.push_back(Ok(LlmStreamEvent::ReasoningDelta {
+                        delta: chunk.content,
+                    }));
+                }
+                Some(Ok(ChatStreamEvent::End(end))) => {
+                    let usage = end.captured_usage.map(normalize_usage).unwrap_or_default();
+                    let mut tool_calls = Vec::new();
+                    if let Some(MessageContent::ToolCalls(calls)) = end.captured_content {
+                        for (index, call) in calls.into_iter().enumerate() {
+                            let arguments = serde_json::to_string(&call.fn_arguments)
+                                .unwrap_or_else(|_| "null".to_owned());
+                            state.queue.push_back(Ok(LlmStreamEvent::ToolCallStart {
+                                index,
+                                id: Some(call.call_id.clone()),
+                                name: Some(call.fn_name.clone()),
+                            }));
+                            state
+                                .queue
+                                .push_back(Ok(LlmStreamEvent::ToolCallArgumentsDelta {
+                                    index,
+                                    delta: arguments,
+                                }));
+                            state
+                                .queue
+                                .push_back(Ok(LlmStreamEvent::ToolCallEnd { index }));
+                            tool_calls.push(ToolCall {
+                                id: call.call_id,
+                                name: call.fn_name,
+                                arguments: call.fn_arguments,
+                            });
+                        }
+                    }
+                    let finish_reason = if tool_calls.is_empty() {
+                        FinishReason::Stop
+                    } else {
+                        FinishReason::ToolCalls
+                    };
+                    state.queue.push_back(Ok(LlmStreamEvent::UsageUpdate {
+                        usage: usage.clone(),
+                    }));
+                    state.queue.push_back(Ok(LlmStreamEvent::FinishReason {
+                        reason: finish_reason.clone(),
+                    }));
+                    state.queue.push_back(Ok(LlmStreamEvent::ResponseCompleted {
+                        response: LlmResponse {
+                            content: (!state.content.is_empty()).then(|| state.content.clone()),
+                            tool_calls,
+                            usage,
+                            finish_reason,
+                            refusal: None,
+                            model: state.model.clone(),
+                            reported_model: None,
+                        },
+                    }));
+                    state.done = true;
+                }
+                Some(Err(error)) => {
+                    state.done = true;
+                    return Some((Err(error::map(error)), state));
+                }
+                None => {
+                    state.done = true;
+                    return Some((
+                        Err(LlmError::IncompleteStream {
+                            received_bytes: state.content.len() + state.reasoning.len(),
+                            finish_event_seen: false,
+                        }),
+                        state,
+                    ));
+                }
+            }
+        }
+    }))
+}
+
+fn normalize_usage(usage: genai::chat::Usage) -> TokenUsage {
+    TokenUsage {
+        prompt_tokens: usage.prompt_tokens.unwrap_or(0).max(0) as u32,
+        completion_tokens: usage.completion_tokens.unwrap_or(0).max(0) as u32,
+        total_tokens: usage.total_tokens.unwrap_or(0).max(0) as u32,
     }
 }
 
@@ -166,5 +325,91 @@ mod tests {
             chat_options(&request(response_format), AdapterKind::OpenAI),
             Err(LlmError::UnsupportedResponseFormat { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn native_stream_is_normalized_and_completed() {
+        let usage = genai::chat::Usage {
+            prompt_tokens: Some(2),
+            completion_tokens: Some(3),
+            total_tokens: Some(5),
+            ..Default::default()
+        };
+        let upstream = stream::iter([
+            Ok::<_, genai::Error>(ChatStreamEvent::Start),
+            Ok(ChatStreamEvent::Chunk(genai::chat::StreamChunk {
+                content: "hello".into(),
+            })),
+            Ok(ChatStreamEvent::ReasoningChunk(genai::chat::StreamChunk {
+                content: "because".into(),
+            })),
+            Ok(ChatStreamEvent::End(genai::chat::StreamEnd {
+                captured_usage: Some(usage),
+                captured_content: Some(MessageContent::Text("hello".into())),
+                captured_reasoning_content: Some("because".into()),
+            })),
+        ]);
+        let events = normalize_stream(upstream, "test-model".into())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            &events[0],
+            Ok(LlmStreamEvent::ResponseStarted {
+                reported_model: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            &events[1],
+            Ok(LlmStreamEvent::TextDelta { delta }) if delta == "hello"
+        ));
+        assert!(matches!(
+            &events[2],
+            Ok(LlmStreamEvent::ReasoningDelta { delta }) if delta == "because"
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(LlmStreamEvent::UsageUpdate { usage }) if usage.total_tokens == 5
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(LlmStreamEvent::ResponseCompleted { response })
+                if response.content.as_deref() == Some("hello")
+                    && response.usage.total_tokens == 5
+                    && response.model == "test-model"
+        )));
+    }
+
+    #[tokio::test]
+    async fn native_stream_preserves_captured_tool_calls() {
+        let call = genai::chat::ToolCall {
+            call_id: "call-1".into(),
+            fn_name: "weather".into(),
+            fn_arguments: serde_json::json!({ "city": "Paris" }),
+        };
+        let upstream = stream::iter([
+            Ok::<_, genai::Error>(ChatStreamEvent::Start),
+            Ok(ChatStreamEvent::End(genai::chat::StreamEnd {
+                captured_usage: None,
+                captured_content: Some(MessageContent::ToolCalls(vec![call])),
+                captured_reasoning_content: None,
+            })),
+        ]);
+        let events = normalize_stream(upstream, "test-model".into())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(LlmStreamEvent::ToolCallStart { id, name, .. })
+                if id.as_deref() == Some("call-1") && name.as_deref() == Some("weather")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(LlmStreamEvent::ResponseCompleted { response })
+                if response.tool_calls.len() == 1
+                    && response.finish_reason == FinishReason::ToolCalls
+        )));
     }
 }

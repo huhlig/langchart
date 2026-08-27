@@ -12,6 +12,7 @@ langchart-adapters = { workspace = true }
 langchart-model    = { workspace = true }
 genai              = "0.3"
 async-trait        = { workspace = true }
+futures            = { workspace = true }
 serde_json         = { workspace = true }
 thiserror          = { workspace = true }
 tracing            = { workspace = true }
