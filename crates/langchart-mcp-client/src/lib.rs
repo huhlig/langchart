@@ -40,7 +40,8 @@ use std::{
 
 use async_trait::async_trait;
 use langchart_adapters::mcp::{
-    CREDENTIALS_META_KEY, McpAdapter, McpCredential, McpError, ResourceContent, ToolDefinition,
+    CREDENTIALS_META_KEY, IDEMPOTENCY_KEY_META_KEY, McpAdapter, McpCredential, McpError,
+    ResourceContent, ToolDefinition,
 };
 use langchart_model::id::{IdempotencyKey, ServerId, ToolName};
 use rmcp::{
@@ -157,6 +158,7 @@ fn build_call_tool_params(
     tool: &ToolName,
     args: serde_json::Value,
     credentials: &[McpCredential],
+    idempotency_key: Option<&IdempotencyKey>,
 ) -> CallToolRequestParams {
     let arguments = match args {
         serde_json::Value::Object(m) => Some(m),
@@ -171,6 +173,7 @@ fn build_call_tool_params(
 
     let mut params = CallToolRequestParams::new(tool.0.clone());
     params.arguments = arguments;
+    let mut meta = serde_json::Map::new();
     if !credentials.is_empty() {
         let values = credentials
             .iter()
@@ -181,11 +184,18 @@ fn build_call_tool_params(
                 )
             })
             .collect();
-        let mut meta = serde_json::Map::new();
         meta.insert(
             CREDENTIALS_META_KEY.to_owned(),
             serde_json::Value::Object(values),
         );
+    }
+    if let Some(key) = idempotency_key {
+        meta.insert(
+            IDEMPOTENCY_KEY_META_KEY.to_owned(),
+            serde_json::Value::String(key.0.clone()),
+        );
+    }
+    if !meta.is_empty() {
         params.meta = Some(Meta(meta));
     }
     params
@@ -199,7 +209,7 @@ impl McpAdapter for LangchartMcpAdapter {
         tool: &ToolName,
         args: serde_json::Value,
         credentials: &[McpCredential],
-        _key: Option<&IdempotencyKey>,
+        key: Option<&IdempotencyKey>,
     ) -> Result<serde_json::Value, McpError> {
         let conn = self
             .registry
@@ -208,7 +218,7 @@ impl McpAdapter for LangchartMcpAdapter {
                 server_id: server_id.clone(),
             })?;
 
-        let params = build_call_tool_params(tool, args, credentials);
+        let params = build_call_tool_params(tool, args, credentials, key);
 
         let result = conn
             .running
@@ -381,6 +391,7 @@ mod tests {
                 secret_ref: SecretRef::new("token"),
                 value: SecretValue("secret-value".into()),
             }],
+            None,
         );
 
         assert_eq!(
@@ -397,6 +408,31 @@ mod tests {
                 .0
                 .get(CREDENTIALS_META_KEY),
             Some(&serde_json::json!({ "token": "secret-value" }))
+        );
+    }
+
+    #[test]
+    fn idempotency_key_is_protocol_metadata_not_tool_argument() {
+        let params = build_call_tool_params(
+            &ToolName::new("write_note"),
+            serde_json::json!({ "body": "hello" }),
+            &[],
+            Some(&IdempotencyKey::new("call-123")),
+        );
+
+        assert_eq!(
+            params
+                .meta
+                .expect("idempotency metadata")
+                .0
+                .get(IDEMPOTENCY_KEY_META_KEY),
+            Some(&serde_json::json!("call-123"))
+        );
+        assert_eq!(
+            params
+                .arguments
+                .and_then(|args| args.get(IDEMPOTENCY_KEY_META_KEY).cloned()),
+            None
         );
     }
 

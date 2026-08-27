@@ -36,6 +36,9 @@ pub struct McpCredential {
 /// Namespaced MCP `_meta` key used for broker-resolved credentials.
 pub const CREDENTIALS_META_KEY: &str = "langchart/credentials";
 
+/// Namespaced MCP `_meta` key used to forward tool-call idempotency keys.
+pub const IDEMPOTENCY_KEY_META_KEY: &str = "langchart/idempotency-key";
+
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     #[error("MCP server `{server_id}` not found")]
@@ -61,8 +64,8 @@ pub trait McpAdapter: Send + Sync {
     ///
     /// `credentials` are short-lived values resolved by the broker and must be
     /// injected into protocol/transport metadata rather than tool arguments.
-    /// `idempotency_key` should be passed to the underlying server when supported,
-    /// enabling safe re-execution on checkpoint recovery.
+    /// `idempotency_key` should be passed to the underlying server when supported.
+    /// A server must explicitly honor the key before retries can be considered safe.
     async fn call_tool(
         &self,
         server_id: &ServerId,

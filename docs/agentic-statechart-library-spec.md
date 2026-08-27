@@ -855,6 +855,8 @@ External side effects (MCP tool calls, artifact commits) MUST use an outbox or e
 - Each external call is recorded with a stable idempotency key before being forwarded.
 - On checkpoint recovery, recorded-but-not-confirmed calls are retried using the same key.
 - Tool adapters SHOULD accept idempotency keys when the underlying system supports them.
+- The built-in MCP client forwards a supplied key in `_meta["langchart/idempotency-key"]`; an MCP server MUST
+  explicitly honor that metadata before the host treats a repeated call as safe.
 - The runtime MUST NOT re-execute already-confirmed external calls on recovery.
 
 Long-running activities MUST have stable invocation IDs that survive checkpoint and recovery.
