@@ -9,7 +9,7 @@ use crate::{
     guard::CompiledGuard,
     id::{StateId, TransitionId},
     schema::check_schema_version,
-    state::{StateDefinition, StateType},
+    state::{ParallelCompletion, StateDefinition, StateType},
     workflow::WorkflowDocument,
 };
 use std::collections::{HashMap, HashSet};
@@ -23,6 +23,8 @@ pub struct CompiledWorkflow {
     pub document: WorkflowDocument,
     /// Pre-compiled CEL guards keyed by their exact transition position.
     pub guards: HashMap<GuardKey, CompiledGuard>,
+    /// Pre-compiled CEL guards for parallel-state completion conditions.
+    pub parallel_completion_guards: HashMap<StateId, CompiledGuard>,
     /// Flat index of all states in the document for O(1) lookup by the runtime.
     /// Built once at compile time; avoids repeated O(n) tree walks per RTC step.
     pub state_index: HashMap<StateId, StateDefinition>,
@@ -46,9 +48,14 @@ pub fn validate(doc: &WorkflowDocument) -> Vec<Diagnostic> {
 
 fn validate_and_compile_guards(
     doc: &WorkflowDocument,
-) -> (Vec<Diagnostic>, HashMap<GuardKey, CompiledGuard>) {
+) -> (
+    Vec<Diagnostic>,
+    HashMap<GuardKey, CompiledGuard>,
+    HashMap<StateId, CompiledGuard>,
+) {
     let mut diags = Vec::new();
     let mut guards = HashMap::new();
+    let mut parallel_completion_guards = HashMap::new();
 
     // 1. Schema version
     if let Err(e) = check_schema_version(&doc.schema_version) {
@@ -61,7 +68,7 @@ fn validate_and_compile_guards(
             },
         ));
         // Cannot proceed with further checks if schema is wrong.
-        return (diags, guards);
+        return (diags, guards, parallel_completion_guards);
     }
 
     // 2. Non-empty state list
@@ -100,22 +107,27 @@ fn validate_and_compile_guards(
     }
 
     // 7. Compile CEL guards once while collecting per-guard diagnostics.
-    check_guards(&doc.states, &mut diags, &mut guards);
+    check_guards(
+        &doc.states,
+        &mut diags,
+        &mut guards,
+        &mut parallel_completion_guards,
+    );
 
     // 8. data_schema guard reference check (Spec §8.2 / §11.1)
     // If data_schema declares fields, any guard that references `data.<name>`
-    // where `<name>` is not in the schema is flagged as E012.
+    // where `<name>` is not in the schema is flagged as W012.
     if !doc.data_schema.fields.is_empty() {
         check_data_schema_guard_refs(&doc.states, &doc.data_schema.fields, &mut diags);
     }
 
-    (diags, guards)
+    (diags, guards, parallel_completion_guards)
 }
 
 /// Compile a workflow document. Runs validation first; returns an error if
 /// any error-severity diagnostics are produced.
 pub fn compile(doc: WorkflowDocument) -> Result<CompiledWorkflow, CompileError> {
-    let (diags, guards) = validate_and_compile_guards(&doc);
+    let (diags, guards, parallel_completion_guards) = validate_and_compile_guards(&doc);
     let errors: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
     if !errors.is_empty() {
         return Err(CompileError::ValidationFailed(errors.len()));
@@ -128,6 +140,7 @@ pub fn compile(doc: WorkflowDocument) -> Result<CompiledWorkflow, CompileError> 
     Ok(CompiledWorkflow {
         document: doc,
         guards,
+        parallel_completion_guards,
         state_index,
     })
 }
@@ -371,7 +384,7 @@ fn check_data_schema_guard_refs(
                         if !schema_fields.contains_key(&field_name) {
                             let tid = TransitionId::new(format!("{}_on_{}", state.id, event_type));
                             diags.push(Diagnostic::warning(
-                                "E012",
+                                "W012",
                                 format!(
                                     "Guard in state `{}` references `data.{}` which is not \
                                      declared in data_schema.fields",
@@ -420,8 +433,26 @@ fn check_guards(
     states: &[StateDefinition],
     diags: &mut Vec<Diagnostic>,
     guards: &mut HashMap<GuardKey, CompiledGuard>,
+    parallel_completion_guards: &mut HashMap<StateId, CompiledGuard>,
 ) {
     for state in states {
+        if let Some(ParallelCompletion::Guard { expr }) = &state.completion {
+            match CompiledGuard::compile(expr) {
+                Ok(guard) => {
+                    parallel_completion_guards.insert(state.id.clone(), guard);
+                }
+                Err(error) => {
+                    diags.push(Diagnostic::error(
+                        "E031",
+                        format!("Parallel completion guard error: {error}"),
+                        DiagnosticLocation::State {
+                            id: state.id.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+
         for (event_type, specs) in &state.on {
             for (transition_index, spec) in specs.iter().enumerate() {
                 if let Some(expr) = &spec.guard {
@@ -451,9 +482,9 @@ fn check_guards(
                 }
             }
         }
-        check_guards(&state.states, diags, guards);
+        check_guards(&state.states, diags, guards, parallel_completion_guards);
         for region in &state.regions {
-            check_guards(&region.states, diags, guards);
+            check_guards(&region.states, diags, guards, parallel_completion_guards);
         }
     }
 }
@@ -675,10 +706,51 @@ mod tests {
 
     // ── E4: data_schema guard reference validation ────────────────────────────
 
-    /// E012 is emitted when a guard references `data.X` but X is not in
+    #[test]
+    fn invalid_parallel_completion_guard_is_an_error() {
+        let mut doc = minimal_atomic_doc();
+        let mut child = doc.states[0].clone();
+        child.id = "nested".into();
+        child.name = "Nested".into();
+        child.on.clear();
+        doc.states[0].state_type = StateType::Parallel;
+        doc.states[0].states = vec![child];
+        doc.states[0].completion = Some(ParallelCompletion::Guard {
+            expr: "read_file()".into(),
+        });
+
+        let diags = validate(&doc);
+        assert!(
+            diags.iter().any(|diagnostic| diagnostic.code == "E031"),
+            "expected E031 for invalid completion guard, got: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn parallel_completion_guard_is_compiled_once() {
+        let mut doc = minimal_atomic_doc();
+        let mut child = doc.states[0].clone();
+        child.id = "nested".into();
+        child.name = "Nested".into();
+        child.on.clear();
+        doc.states[0].state_type = StateType::Parallel;
+        doc.states[0].states = vec![child];
+        doc.states[0].completion = Some(ParallelCompletion::Guard {
+            expr: "completed == total".into(),
+        });
+
+        let compiled = compile(doc).expect("compile");
+        assert!(
+            compiled
+                .parallel_completion_guards
+                .contains_key(&StateId::new("start"))
+        );
+    }
+
+    /// W012 is emitted when a guard references `data.X` but X is not in
     /// `data_schema.fields` (and the schema is non-empty).
     #[test]
-    fn undeclared_data_field_in_guard_emits_e012() {
+    fn undeclared_data_field_in_guard_emits_w012() {
         let mut doc = minimal_atomic_doc();
         // Declare a data_schema with one field "score".
         doc.data_schema.fields.insert("score".into(), "f64".into());
@@ -687,14 +759,14 @@ mod tests {
             Some("data.undeclared_field == true".into());
         let diags = validate(&doc);
         assert!(
-            diags.iter().any(|d| d.code == "E012"),
-            "expected E012 for undeclared data field, got: {diags:#?}"
+            diags.iter().any(|d| d.code == "W012"),
+            "expected W012 for undeclared data field, got: {diags:#?}"
         );
     }
 
-    /// No E012 when the referenced field IS declared in data_schema.
+    /// No W012 when the referenced field IS declared in data_schema.
     #[test]
-    fn declared_data_field_in_guard_no_e012() {
+    fn declared_data_field_in_guard_no_w012() {
         let mut doc = minimal_atomic_doc();
         doc.data_schema
             .fields
@@ -702,22 +774,22 @@ mod tests {
         doc.states[0].on.get_mut("done").unwrap()[0].guard = Some("data.approved == true".into());
         let diags = validate(&doc);
         assert!(
-            !diags.iter().any(|d| d.code == "E012"),
-            "unexpected E012 for declared data field: {diags:#?}"
+            !diags.iter().any(|d| d.code == "W012"),
+            "unexpected W012 for declared data field: {diags:#?}"
         );
     }
 
-    /// No E012 when data_schema is empty (opt-in: validation only fires when
+    /// No W012 when data_schema is empty (opt-in: validation only fires when
     /// the schema is explicitly declared).
     #[test]
-    fn empty_data_schema_no_e012() {
+    fn empty_data_schema_no_w012() {
         let mut doc = minimal_atomic_doc();
         // data_schema.fields is empty (default).
         doc.states[0].on.get_mut("done").unwrap()[0].guard = Some("data.any_field == 42".into());
         let diags = validate(&doc);
         assert!(
-            !diags.iter().any(|d| d.code == "E012"),
-            "E012 must not fire when data_schema is empty: {diags:#?}"
+            !diags.iter().any(|d| d.code == "W012"),
+            "W012 must not fire when data_schema is empty: {diags:#?}"
         );
     }
 

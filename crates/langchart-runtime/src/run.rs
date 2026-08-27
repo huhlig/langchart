@@ -1292,19 +1292,16 @@ impl WorkflowInstance {
             ParallelCompletion::All => completed == total,
             ParallelCompletion::Any => completed >= 1,
             ParallelCompletion::Quorum { n } => completed >= *n,
-            ParallelCompletion::Guard { expr } => {
-                // Evaluate CEL with `completed` and `total` as variables.
-                use cel_interpreter::{Context, Program};
-                Program::compile(expr)
-                    .ok()
-                    .and_then(|prog| {
-                        let mut ctx = Context::default();
-                        let _ = ctx.add_variable("completed", completed as i64);
-                        let _ = ctx.add_variable("total", total as i64);
-                        prog.execute(&ctx).ok()
-                    })
-                    .map(|v| matches!(v, cel_interpreter::objects::Value::Bool(true)))
-                    .unwrap_or(false)
+            ParallelCompletion::Guard { .. } => {
+                let Some(guard) = self.workflow.parallel_completion_guards.get(parallel_id) else {
+                    return Err(EngineError::Activity(format!(
+                        "compiled completion guard missing for parallel state `{parallel_id}`"
+                    )));
+                };
+                let mut context = langchart_model::guard::evaluation_context();
+                let _ = context.add_variable("completed", completed as i64);
+                let _ = context.add_variable("total", total as i64);
+                guard.evaluate(&context).unwrap_or(false)
             }
             ParallelCompletion::Manual => false, // Requires explicit external event.
         };

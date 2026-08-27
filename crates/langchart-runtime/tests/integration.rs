@@ -918,6 +918,84 @@ async fn parallel_any_completion() {
 }
 
 #[tokio::test]
+async fn parallel_completion_guard_uses_compiled_expression() {
+    use langchart_model::{
+        id::RegionId,
+        state::{ParallelCompletion, ParallelRegion},
+    };
+
+    let mut parallel = leaf_state("parallel_guard", StateType::Parallel);
+    parallel.completion = Some(ParallelCompletion::Guard {
+        expr: "completed == total".into(),
+    });
+    parallel.regions = vec![
+        ParallelRegion {
+            id: RegionId::new("left"),
+            name: "Left".into(),
+            initial: StateId::new("left_work"),
+            states: vec![
+                with_transition(
+                    leaf_state("left_work", StateType::Atomic),
+                    "left.done",
+                    "left_final",
+                    None,
+                ),
+                leaf_state("left_final", StateType::Final),
+            ],
+        },
+        ParallelRegion {
+            id: RegionId::new("right"),
+            name: "Right".into(),
+            initial: StateId::new("right_work"),
+            states: vec![
+                with_transition(
+                    leaf_state("right_work", StateType::Atomic),
+                    "right.done",
+                    "right_final",
+                    None,
+                ),
+                leaf_state("right_final", StateType::Final),
+            ],
+        },
+    ];
+    parallel = with_transition(parallel, "parallel.completed", "done", None);
+
+    let compiled = Arc::new(
+        compile(base_doc(
+            "parallel-completion-guard",
+            vec![parallel, leaf_state("done", StateType::Final)],
+            "parallel_guard",
+        ))
+        .expect("compile"),
+    );
+    assert!(
+        compiled
+            .parallel_completion_guards
+            .contains_key(&StateId::new("parallel_guard"))
+    );
+
+    let sink = Arc::new(VecSink::default());
+    let mut instance = WorkflowInstance::new(
+        RunId::new("r-parallel-completion-guard"),
+        compiled,
+        bare_broker(sink.clone()),
+        sink,
+        HashMap::new(),
+    );
+    instance.start().await.expect("start");
+
+    instance.send("left.done", serde_json::Value::Null);
+    assert!(!instance.step().await.expect("complete left region"));
+    assert_eq!(instance.status, RunStatus::Running);
+
+    instance.send("right.done", serde_json::Value::Null);
+    assert_eq!(
+        instance.run_to_completion().await.expect("complete run"),
+        RunStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn event_bubbles_once_to_active_parallel_parent() {
     use langchart_model::{
         id::RegionId,
