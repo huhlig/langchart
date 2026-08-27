@@ -7,8 +7,8 @@
 use crate::error::LoadError;
 use semver::{Version, VersionReq};
 
-/// The library's current supported schema version.
-pub const LIBRARY_SCHEMA_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Backward-compatible name for the current workflow schema version.
+pub use crate::workflow::CURRENT_SCHEMA_VERSION as LIBRARY_SCHEMA_VERSION;
 
 /// The schema version requirement this library accepts.
 /// Major version must match; minor and patch may be newer (forward-compatible reads).
@@ -41,7 +41,7 @@ mod tests {
 
     #[test]
     fn same_version_accepted() {
-        assert!(check_schema_version("1.0.0").is_ok());
+        assert!(check_schema_version(LIBRARY_SCHEMA_VERSION).is_ok());
     }
 
     #[test]
