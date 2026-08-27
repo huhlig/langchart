@@ -83,8 +83,16 @@ fn validate_and_compile_guards(
         ));
     }
 
-    // 3. Collect all declared state IDs (flat walk)
-    let all_ids = collect_all_state_ids(&doc.states);
+    // 3. Collect all states and declared IDs in one tree walk.
+    let mut all_states = Vec::new();
+    let mut all_ids = HashSet::new();
+    let mut duplicate_ids = Vec::new();
+    collect_states(
+        &doc.states,
+        &mut all_states,
+        &mut all_ids,
+        &mut duplicate_ids,
+    );
 
     // 4. Initial state exists
     if !doc.initial.is_empty() && !all_ids.contains(doc.initial.as_str()) {
@@ -99,10 +107,16 @@ fn validate_and_compile_guards(
     }
 
     // 5. Duplicate state IDs
-    check_duplicate_ids(&doc.states, &mut diags);
+    for id in duplicate_ids {
+        diags.push(Diagnostic::error(
+            "E004",
+            format!("Duplicate state ID `{id}`"),
+            DiagnosticLocation::State { id },
+        ));
+    }
 
-    // 6. Validate each state recursively
-    for state in &doc.states {
+    // 6. Validate each state from the pre-order collection above.
+    for state in all_states {
         validate_state(state, &all_ids, &mut diags);
     }
 
@@ -157,41 +171,20 @@ fn build_state_index(states: &[StateDefinition], index: &mut HashMap<StateId, St
     }
 }
 
-fn collect_all_state_ids(states: &[StateDefinition]) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    for state in states {
-        ids.insert(state.id.0.clone());
-        ids.extend(collect_all_state_ids(&state.states));
-        for region in &state.regions {
-            ids.extend(collect_all_state_ids(&region.states));
-        }
-    }
-    ids
-}
-
-fn check_duplicate_ids(states: &[StateDefinition], diags: &mut Vec<Diagnostic>) {
-    let mut seen = HashSet::new();
-    check_duplicate_ids_inner(states, &mut seen, diags);
-}
-
-fn check_duplicate_ids_inner(
-    states: &[StateDefinition],
-    seen: &mut HashSet<String>,
-    diags: &mut Vec<Diagnostic>,
+fn collect_states<'a>(
+    states: &'a [StateDefinition],
+    all_states: &mut Vec<&'a StateDefinition>,
+    all_ids: &mut HashSet<String>,
+    duplicate_ids: &mut Vec<StateId>,
 ) {
     for state in states {
-        if !seen.insert(state.id.0.clone()) {
-            diags.push(Diagnostic::error(
-                "E004",
-                format!("Duplicate state ID `{}`", state.id),
-                DiagnosticLocation::State {
-                    id: state.id.clone(),
-                },
-            ));
+        all_states.push(state);
+        if !all_ids.insert(state.id.0.clone()) {
+            duplicate_ids.push(state.id.clone());
         }
-        check_duplicate_ids_inner(&state.states, seen, diags);
+        collect_states(&state.states, all_states, all_ids, duplicate_ids);
         for region in &state.regions {
-            check_duplicate_ids_inner(&region.states, seen, diags);
+            collect_states(&region.states, all_states, all_ids, duplicate_ids);
         }
     }
 }
@@ -327,16 +320,6 @@ fn validate_state(state: &StateDefinition, all_ids: &HashSet<String>, diags: &mu
 
     // Check priority ties (multiple transitions on the same event with same priority)
     check_transition_priority_ties(state, diags);
-
-    // Recurse
-    for child in &state.states {
-        validate_state(child, all_ids, diags);
-    }
-    for region in &state.regions {
-        for child in &region.states {
-            validate_state(child, all_ids, diags);
-        }
-    }
 }
 
 fn check_transition_priority_ties(state: &StateDefinition, diags: &mut Vec<Diagnostic>) {
@@ -609,6 +592,21 @@ mod tests {
         doc.states[0].on.get_mut("done").unwrap()[0].target = "ghost".into();
         let diags = validate(&doc);
         assert!(diags.iter().any(|d| d.code == "E005"));
+    }
+
+    #[test]
+    fn every_duplicate_state_occurrence_is_reported() {
+        let mut doc = minimal_atomic_doc();
+        let duplicate = doc.states[1].clone();
+        doc.states.push(duplicate.clone());
+        doc.states.push(duplicate);
+
+        let duplicate_count = validate(&doc)
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E004")
+            .count();
+
+        assert_eq!(duplicate_count, 2);
     }
 
     #[test]
