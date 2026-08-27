@@ -451,7 +451,7 @@ A transition defines:
 - triggering event type (required);
 - CEL guard expression (optional; absence means always-true);
 - target state;
-- optional transition actions (side-effect-free data transformations);
+- optional registered transition actions;
 - priority (integer, lower = higher priority) where ambiguity is possible.
 
 **Guard evaluation:**
@@ -830,7 +830,7 @@ The runtime uses run-to-completion (RTC) semantics for event processing:
 3. Determine enabled transitions from the active configuration.
 4. Select transitions deterministically (by priority, then source depth).
 5. Exit affected states from inner to outer.
-6. Execute transition actions (synchronous, side-effect-free).
+6. Execute registered transition actions.
 7. Enter target states from outer to inner.
 8. Start eligible activities (agent actors, subworkflow invocations).
 9. Persist the new configuration and emitted events.

@@ -182,11 +182,12 @@ pub struct ActionContext {
     pub trigger: ActionTrigger,
 }
 
-/// Whether the action is running on state entry or exit.
+/// Whether the action is running on state entry, state exit, or a transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionTrigger {
     Entry,
     Exit,
+    Transition,
 }
 
 /// An error returned by a [`StateAction`].
@@ -197,11 +198,11 @@ pub struct ActionError {
     pub message: String,
 }
 
-/// A synchronous side-effect attached to a state's entry or exit.
+/// A synchronous side-effect attached to a state or transition.
 ///
 /// Actions are identified by string ID in the workflow document
-/// (`on_entry: ["log_started"]`) and registered with the `ActionRegistry`
-/// when constructing the `WorkflowInstance`.
+/// (`on_entry: ["log_started"]` or transition `actions: ["audit"]`) and
+/// registered with the `ActionRegistry` when constructing the `WorkflowInstance`.
 ///
 /// Actions must complete quickly. Long-running work belongs in an
 /// `AgentActor`, not a `StateAction`.

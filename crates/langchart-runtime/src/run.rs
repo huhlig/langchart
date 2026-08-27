@@ -244,7 +244,7 @@ pub struct WorkflowInstance {
     // Per-state agent actor registry.
     actors: HashMap<StateId, Arc<dyn AgentActor>>,
 
-    // Action registry (on_entry / on_exit action IDs → implementations).
+    // Action registry (state and transition action IDs → implementations).
     action_registry: HashMap<String, Arc<dyn StateAction>>,
 
     // ── Phase 4: Parallel completion tracking ────────────────────────────────
@@ -304,7 +304,7 @@ impl WorkflowInstance {
         Self::with_actions(run_id, workflow, broker, event_sink, actors, HashMap::new())
     }
 
-    /// Like `new` but also accepts an action registry for on_entry/on_exit hooks.
+    /// Like `new` but also accepts a registry for state and transition actions.
     pub fn with_actions(
         run_id: RunId,
         workflow: Arc<CompiledWorkflow>,
@@ -718,6 +718,8 @@ impl WorkflowInstance {
                         target = %target_id,
                         "internal transition — skipping exit/enter"
                     );
+                    self.run_actions(&source_state_id, &spec.actions, ActionTrigger::Transition)
+                        .await?;
                 }
 
                 // ── Local ─────────────────────────────────────────────────
@@ -754,6 +756,12 @@ impl WorkflowInstance {
                         for leaf in leaves_to_exit {
                             self.exit_state(&leaf).await?;
                         }
+                        self.run_actions(
+                            &source_state_id,
+                            &spec.actions,
+                            ActionTrigger::Transition,
+                        )
+                        .await?;
                         self.enter_state(&target_id).await?;
                     } else {
                         // Target is outside the source boundary — fall back to
@@ -765,6 +773,12 @@ impl WorkflowInstance {
                             "local transition — target not a descendant, using external semantics"
                         );
                         self.exit_state(&source_state_id).await?;
+                        self.run_actions(
+                            &source_state_id,
+                            &spec.actions,
+                            ActionTrigger::Transition,
+                        )
+                        .await?;
                         self.enter_state(&target_id).await?;
                     }
                 }
@@ -772,6 +786,8 @@ impl WorkflowInstance {
                 // ── External (default) ────────────────────────────────────
                 TransitionKind::External => {
                     self.exit_state(&source_state_id).await?;
+                    self.run_actions(&source_state_id, &spec.actions, ActionTrigger::Transition)
+                        .await?;
                     self.enter_state(&target_id).await?;
                 }
             }
@@ -1537,7 +1553,7 @@ impl WorkflowInstance {
                         run = %self.run_id,
                         state = %state_id,
                         action_id = %action_id,
-                        "on_entry/on_exit action not found in registry; skipping"
+                        "registered action not found; skipping"
                     );
                     continue;
                 }
@@ -1579,7 +1595,7 @@ impl WorkflowInstance {
                         state = %state_id,
                         action_id = %action_id,
                         error = %e,
-                        "on_entry/on_exit action failed; continuing"
+                        "registered action failed; continuing"
                     );
                 }
             }

@@ -199,7 +199,7 @@ pub enum RuntimeEventPayload {
         message: String,
     },
 
-    // Actions (on_entry / on_exit)
+    // State and transition actions
     ActionStarted {
         state_id: StateId,
         action_id: String,

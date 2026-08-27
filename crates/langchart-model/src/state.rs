@@ -195,7 +195,7 @@ pub struct TransitionSpec {
     /// Transition priority — lower integer = higher priority. Default 0.
     #[serde(default)]
     pub priority: i32,
-    /// CEL data-transform expressions to evaluate during the transition.
+    /// Registered action IDs executed after state exit and before target entry.
     #[serde(default)]
     pub actions: Vec<String>,
     /// Transition kind. Default: External.

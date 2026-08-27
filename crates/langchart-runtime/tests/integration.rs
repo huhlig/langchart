@@ -1062,6 +1062,105 @@ async fn subworkflow_failure_handled() {
 
 // ── B1: on_entry / on_exit action tests ──────────────────────────────────────
 
+/// Transition actions run after source exit actions and before target entry actions.
+#[tokio::test]
+async fn transition_actions_run_between_exit_and_entry() {
+    use langchart_runtime::instance::{
+        ActionContext, ActionError, ActionRegistry, ActionTrigger, StateAction,
+    };
+
+    struct RecordAction {
+        label: &'static str,
+        expected_trigger: ActionTrigger,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl StateAction for RecordAction {
+        async fn run(
+            &self,
+            ctx: ActionContext,
+            _broker: Arc<CapabilityBroker>,
+        ) -> Result<(), ActionError> {
+            assert_eq!(ctx.trigger, self.expected_trigger);
+            self.calls.lock().await.push(self.label);
+            Ok(())
+        }
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::new(VecSink::default());
+    let broker = bare_broker(sink.clone());
+
+    let mut start = leaf_state("start", StateType::Atomic);
+    start.on_exit = vec!["exit".into()];
+    start.on.insert(
+        "go".into(),
+        vec![TransitionSpec {
+            target: "next".into(),
+            guard: None,
+            priority: 0,
+            actions: vec!["transition".into()],
+            kind: TransitionKind::External,
+        }],
+    );
+    let mut next = leaf_state("next", StateType::Atomic);
+    next.on_entry = vec!["entry".into()];
+
+    let compiled = Arc::new(
+        compile(base_doc(
+            "transition-action-order",
+            vec![start, next],
+            "start",
+        ))
+        .expect("compile"),
+    );
+    let registry = ActionRegistry::new()
+        .register(
+            "exit",
+            RecordAction {
+                label: "exit",
+                expected_trigger: ActionTrigger::Exit,
+                calls: calls.clone(),
+            },
+        )
+        .register(
+            "transition",
+            RecordAction {
+                label: "transition",
+                expected_trigger: ActionTrigger::Transition,
+                calls: calls.clone(),
+            },
+        )
+        .register(
+            "entry",
+            RecordAction {
+                label: "entry",
+                expected_trigger: ActionTrigger::Entry,
+                calls: calls.clone(),
+            },
+        )
+        .into_map();
+
+    let mut inst = WorkflowInstance::with_actions(
+        RunId::new("r-transition-action-order"),
+        compiled,
+        broker,
+        sink,
+        HashMap::new(),
+        registry,
+    );
+    inst.start().await.expect("start");
+    inst.send("go", serde_json::Value::Null);
+    inst.step().await.expect("step");
+
+    assert_eq!(
+        calls.lock().await.as_slice(),
+        ["exit", "transition", "entry"]
+    );
+    assert_eq!(inst.active_states, vec![StateId::new("next")]);
+}
+
 /// 10. on_entry action fires when a state is entered; on_exit fires on exit.
 #[tokio::test]
 async fn on_entry_and_on_exit_actions_fire() {
@@ -3226,7 +3325,7 @@ async fn checkpoint_round_trips_through_store() {
 
 // ── F3: Internal / Local transition kinds ────────────────────────────────────
 
-/// 24. Internal transition does NOT re-run on_entry / on_exit.
+/// 24. Internal transition runs its own actions without re-running on_entry / on_exit.
 ///
 /// Workflow: `start` (atomic, on_entry increments counter) --internal--> same
 /// target `start`.  After firing, `active_states` still contains `start` and
@@ -3237,6 +3336,7 @@ async fn internal_transition_does_not_rerun_on_entry() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     let entry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let transition_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     struct CountEntry(Arc<AtomicU32>);
     #[async_trait]
@@ -3263,7 +3363,7 @@ async fn internal_transition_does_not_rerun_on_entry() {
             target: "start".into(), // same state — internal
             guard: None,
             priority: 0,
-            actions: vec![],
+            actions: vec!["count_transition".into()],
             kind: TransitionKind::Internal,
         }],
     );
@@ -3288,6 +3388,7 @@ async fn internal_transition_does_not_rerun_on_entry() {
 
     let registry = ActionRegistry::new()
         .register("count_entry", CountEntry(entry_count.clone()))
+        .register("count_transition", CountEntry(transition_count.clone()))
         .into_map();
 
     let mut inst = WorkflowInstance::with_actions(
@@ -3319,6 +3420,11 @@ async fn internal_transition_does_not_rerun_on_entry() {
         entry_count.load(Ordering::SeqCst),
         1,
         "internal transition must NOT re-run on_entry"
+    );
+    assert_eq!(
+        transition_count.load(Ordering::SeqCst),
+        1,
+        "internal transition must run its transition action"
     );
     assert_eq!(
         inst.status,
