@@ -5,8 +5,9 @@
 //! This module is WASM-compatible — no I/O, no async.
 
 use crate::error::GuardError;
-use cel_interpreter::{Context, Program};
+use cel_interpreter::{Context, Program, objects::Value};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 // ── Extension whitelist ───────────────────────────────────────────────────────
 
@@ -21,6 +22,41 @@ pub const APPROVED_EXTENSIONS: &[&str] = &[
     "contains_all",
     "contains_any",
     "is_empty",
+];
+
+/// Pure functions supplied by `cel-interpreter`'s default context. These are
+/// part of the CEL execution environment rather than Langchart extensions.
+const CEL_BUILTINS: &[&str] = &[
+    "contains",
+    "size",
+    "has",
+    "map",
+    "filter",
+    "all",
+    "max",
+    "min",
+    "startsWith",
+    "endsWith",
+    "string",
+    "bytes",
+    "double",
+    "exists",
+    "exists_one",
+    "int",
+    "uint",
+    "matches",
+    "duration",
+    "timestamp",
+    "getFullYear",
+    "getMonth",
+    "getDayOfYear",
+    "getDayOfMonth",
+    "getDate",
+    "getDayOfWeek",
+    "getHours",
+    "getMinutes",
+    "getSeconds",
+    "getMilliseconds",
 ];
 
 /// Returns the approved extension function name set as a `HashSet`.
@@ -54,14 +90,21 @@ impl CompiledGuard {
     /// Returns [`GuardError::DisallowedExtension`] if the expression calls a
     /// function not in the approved whitelist.
     pub fn compile(expr: &str) -> Result<Self, GuardError> {
-        // Reject obviously disallowed function calls by scanning the AST.
-        // CEL's Program::compile will catch syntax errors first.
-        let program = Program::compile(expr).map_err(|e| GuardError::Parse(e.to_string()))?;
+        let parsed = cel_parser::parse(expr).map_err(|e| GuardError::Parse(e.to_string()))?;
+        let builtins: HashSet<_> = CEL_BUILTINS.iter().copied().collect();
+        let extensions = approved_extension_set();
+        if let Some(name) = parsed
+            .references()
+            .functions()
+            .into_iter()
+            .find(|name| !builtins.contains(name) && !extensions.contains(name))
+        {
+            return Err(GuardError::DisallowedExtension {
+                name: name.to_owned(),
+            });
+        }
 
-        // Note: approved_extension_set() defines the whitelist.
-        // Full enforcement of unknown function calls is done by cel-interpreter
-        // at eval time via function resolution. Static AST-walk checking would
-        // require a cel-interpreter API that does not currently exist.
+        let program = Program::compile(expr).map_err(|e| GuardError::Parse(e.to_string()))?;
 
         Ok(Self {
             program,
@@ -88,6 +131,61 @@ impl CompiledGuard {
     /// Always-true sentinel — used when a transition has no guard expression.
     pub fn always_true() -> AlwaysTrueGuard {
         AlwaysTrueGuard
+    }
+}
+
+/// Build the deterministic CEL context used for guard evaluation.
+pub fn evaluation_context() -> Context<'static> {
+    let mut context = Context::default();
+    context.add_function("version_gte", version_gte);
+    context.add_function("version_lte", version_lte);
+    context.add_function("contains_all", contains_all);
+    context.add_function("contains_any", contains_any);
+    context.add_function("is_empty", is_empty);
+    context
+}
+
+fn version_gte(left: Arc<String>, right: Arc<String>) -> bool {
+    compare_versions(&left, &right).is_some_and(|ordering| !ordering.is_lt())
+}
+
+fn version_lte(left: Arc<String>, right: Arc<String>) -> bool {
+    compare_versions(&left, &right).is_some_and(|ordering| !ordering.is_gt())
+}
+
+fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    Some(
+        semver::Version::parse(left)
+            .ok()?
+            .cmp(&semver::Version::parse(right).ok()?),
+    )
+}
+
+fn contains_all(haystack: Value, needles: Value) -> bool {
+    match (haystack, needles) {
+        (Value::List(haystack), Value::List(needles)) => {
+            needles.iter().all(|needle| haystack.contains(needle))
+        }
+        _ => false,
+    }
+}
+
+fn contains_any(haystack: Value, needles: Value) -> bool {
+    match (haystack, needles) {
+        (Value::List(haystack), Value::List(needles)) => {
+            needles.iter().any(|needle| haystack.contains(needle))
+        }
+        _ => false,
+    }
+}
+
+fn is_empty(value: Value) -> bool {
+    match value {
+        Value::List(value) => value.is_empty(),
+        Value::Map(value) => value.map.is_empty(),
+        Value::String(value) => value.is_empty(),
+        Value::Bytes(value) => value.is_empty(),
+        _ => false,
     }
 }
 
@@ -124,5 +222,31 @@ mod tests {
     fn parse_error_is_reported() {
         let result = CompiledGuard::compile("!!! invalid cel ???");
         assert!(matches!(result, Err(GuardError::Parse(_))));
+    }
+
+    #[test]
+    fn unknown_extension_is_rejected_at_compile_time() {
+        let result = CompiledGuard::compile("read_file('/secret') == true");
+        assert!(matches!(
+            result,
+            Err(GuardError::DisallowedExtension { name }) if name == "read_file"
+        ));
+    }
+
+    #[test]
+    fn builtins_and_approved_extensions_are_executable() {
+        let context = evaluation_context();
+        assert!(
+            CompiledGuard::compile("size([1, 2]) == 2")
+                .unwrap()
+                .evaluate(&context)
+                .unwrap()
+        );
+        assert!(
+            CompiledGuard::compile("version_gte('1.2.0', '1.1.9') && contains_all([1, 2], [2])")
+                .unwrap()
+                .evaluate(&context)
+                .unwrap()
+        );
     }
 }

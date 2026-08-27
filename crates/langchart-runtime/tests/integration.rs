@@ -492,6 +492,40 @@ async fn guard_passes_transition() {
     );
 }
 
+/// The runtime executes the guard program captured during workflow compilation,
+/// rather than recompiling the mutable source document at transition time.
+#[tokio::test]
+async fn runtime_uses_precompiled_guard() {
+    let states = vec![
+        with_transition(
+            leaf_state("idle", StateType::Atomic),
+            "done",
+            "end",
+            Some("approved == true"),
+        ),
+        leaf_state("end", StateType::Final),
+    ];
+    let mut compiled = compile(base_doc("wf-compiled-guard", states, "idle")).expect("compile");
+    compiled.document.states[0].on.get_mut("done").unwrap()[0].guard = Some("false".into());
+
+    let sink = Arc::new(VecSink::default());
+    let broker = bare_broker(sink.clone());
+    let mut instance = WorkflowInstance::new(
+        RunId::new("r-compiled-guard"),
+        Arc::new(compiled),
+        broker,
+        sink,
+        HashMap::new(),
+    );
+    instance.start().await.expect("start");
+    instance.send("done", serde_json::json!({ "approved": true }));
+
+    assert_eq!(
+        instance.run_to_completion().await.expect("run"),
+        RunStatus::Completed
+    );
+}
+
 /// 5. Actor that fails produces an `ActivityFailed` observable event.
 #[tokio::test]
 async fn actor_failure_produces_activity_failed() {

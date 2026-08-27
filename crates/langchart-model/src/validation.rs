@@ -21,11 +21,19 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug)]
 pub struct CompiledWorkflow {
     pub document: WorkflowDocument,
-    /// Pre-compiled CEL guards keyed by `(state_id, event_type)`.
-    pub guards: HashMap<(StateId, String), CompiledGuard>,
+    /// Pre-compiled CEL guards keyed by their exact transition position.
+    pub guards: HashMap<GuardKey, CompiledGuard>,
     /// Flat index of all states in the document for O(1) lookup by the runtime.
     /// Built once at compile time; avoids repeated O(n) tree walks per RTC step.
     pub state_index: HashMap<StateId, StateDefinition>,
+}
+
+/// Stable address of a transition guard within a compiled workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GuardKey {
+    pub state_id: StateId,
+    pub event_type: String,
+    pub transition_index: usize,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -33,7 +41,14 @@ pub struct CompiledWorkflow {
 /// Validate a workflow document and return all diagnostics.
 /// A workflow with no [`Severity::Error`] diagnostics is considered valid.
 pub fn validate(doc: &WorkflowDocument) -> Vec<Diagnostic> {
+    validate_and_compile_guards(doc).0
+}
+
+fn validate_and_compile_guards(
+    doc: &WorkflowDocument,
+) -> (Vec<Diagnostic>, HashMap<GuardKey, CompiledGuard>) {
     let mut diags = Vec::new();
+    let mut guards = HashMap::new();
 
     // 1. Schema version
     if let Err(e) = check_schema_version(&doc.schema_version) {
@@ -46,7 +61,7 @@ pub fn validate(doc: &WorkflowDocument) -> Vec<Diagnostic> {
             },
         ));
         // Cannot proceed with further checks if schema is wrong.
-        return diags;
+        return (diags, guards);
     }
 
     // 2. Non-empty state list
@@ -84,8 +99,8 @@ pub fn validate(doc: &WorkflowDocument) -> Vec<Diagnostic> {
         validate_state(state, &all_ids, &mut diags);
     }
 
-    // 7. CEL guard compilation (warning-level; errors are collected per-guard)
-    check_guards(&doc.states, &mut diags);
+    // 7. Compile CEL guards once while collecting per-guard diagnostics.
+    check_guards(&doc.states, &mut diags, &mut guards);
 
     // 8. data_schema guard reference check (Spec §8.2 / §11.1)
     // If data_schema declares fields, any guard that references `data.<name>`
@@ -94,21 +109,17 @@ pub fn validate(doc: &WorkflowDocument) -> Vec<Diagnostic> {
         check_data_schema_guard_refs(&doc.states, &doc.data_schema.fields, &mut diags);
     }
 
-    diags
+    (diags, guards)
 }
 
 /// Compile a workflow document. Runs validation first; returns an error if
 /// any error-severity diagnostics are produced.
 pub fn compile(doc: WorkflowDocument) -> Result<CompiledWorkflow, CompileError> {
-    let diags = validate(&doc);
+    let (diags, guards) = validate_and_compile_guards(&doc);
     let errors: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
     if !errors.is_empty() {
         return Err(CompileError::ValidationFailed(errors.len()));
     }
-
-    // Pre-compile all guards.
-    let mut guards = HashMap::new();
-    compile_guards(&doc.states, &mut guards)?;
 
     // Build flat state index for O(1) runtime lookup.
     let mut state_index = HashMap::new();
@@ -384,63 +395,50 @@ fn extract_data_field_refs(expr: &str) -> Vec<String> {
     found
 }
 
-fn check_guards(states: &[StateDefinition], diags: &mut Vec<Diagnostic>) {
+fn check_guards(
+    states: &[StateDefinition],
+    diags: &mut Vec<Diagnostic>,
+    guards: &mut HashMap<GuardKey, CompiledGuard>,
+) {
     for state in states {
         for (event_type, specs) in &state.on {
-            for spec in specs {
-                if let Some(expr) = &spec.guard
-                    && let Err(e) = CompiledGuard::compile(expr)
-                {
-                    let tid = TransitionId::new(format!("{}_on_{}", state.id, event_type));
-                    diags.push(Diagnostic::error(
-                        "E006",
-                        format!("Guard expression error: {e}"),
-                        DiagnosticLocation::Guard {
-                            state_id: state.id.clone(),
-                            transition_id: tid,
-                        },
-                    ));
+            for (transition_index, spec) in specs.iter().enumerate() {
+                if let Some(expr) = &spec.guard {
+                    match CompiledGuard::compile(expr) {
+                        Ok(guard) => {
+                            guards.insert(
+                                GuardKey {
+                                    state_id: state.id.clone(),
+                                    event_type: event_type.clone(),
+                                    transition_index,
+                                },
+                                guard,
+                            );
+                        }
+                        Err(error) => {
+                            let tid = transition_id(&state.id, event_type, transition_index);
+                            diags.push(Diagnostic::error(
+                                "E006",
+                                format!("Guard expression error: {error}"),
+                                DiagnosticLocation::Guard {
+                                    state_id: state.id.clone(),
+                                    transition_id: tid,
+                                },
+                            ));
+                        }
+                    }
                 }
             }
         }
-        check_guards(&state.states, diags);
+        check_guards(&state.states, diags, guards);
         for region in &state.regions {
-            check_guards(&region.states, diags);
+            check_guards(&region.states, diags, guards);
         }
     }
 }
 
-fn compile_guards(
-    states: &[StateDefinition],
-    guards: &mut HashMap<(StateId, String), CompiledGuard>,
-) -> Result<(), CompileError> {
-    for state in states {
-        for (event_type, specs) in &state.on {
-            for spec in specs {
-                if let Some(expr) = &spec.guard {
-                    let guard = CompiledGuard::compile(expr).map_err(|source| {
-                        CompileError::GuardCompile {
-                            state_id: state.id.clone(),
-                            transition_id: TransitionId::new(format!(
-                                "{}_on_{}",
-                                state.id, event_type
-                            )),
-                            source,
-                        }
-                    })?;
-                    // Note: if multiple transitions exist for the same event, later
-                    // guards overwrite earlier ones in the compiled map. The runtime
-                    // evaluates guards directly from the state definition.
-                    guards.insert((state.id.clone(), event_type.clone()), guard);
-                }
-            }
-        }
-        compile_guards(&state.states, guards)?;
-        for region in &state.regions {
-            compile_guards(&region.states, guards)?;
-        }
-    }
-    Ok(())
+fn transition_id(state_id: &StateId, event_type: &str, transition_index: usize) -> TransitionId {
+    TransitionId::new(format!("{state_id}_on_{event_type}_{transition_index}"))
 }
 
 #[cfg(test)]
@@ -609,6 +607,33 @@ mod tests {
             !diags.iter().any(|d| d.code == "E011"),
             "unexpected E011 diagnostic: {diags:#?}"
         );
+    }
+
+    #[test]
+    fn every_transition_guard_has_a_distinct_compiled_entry() {
+        let mut doc = minimal_atomic_doc();
+        let transitions = doc.states[0].on.get_mut("done").unwrap();
+        transitions[0].guard = Some("true".into());
+        transitions.push(TransitionSpec {
+            target: "end".into(),
+            guard: Some("false".into()),
+            priority: 1,
+            actions: vec![],
+            kind: Default::default(),
+        });
+
+        let compiled = compile(doc).unwrap();
+        assert_eq!(compiled.guards.len(), 2);
+        assert!(compiled.guards.contains_key(&GuardKey {
+            state_id: "start".into(),
+            event_type: "done".into(),
+            transition_index: 0,
+        }));
+        assert!(compiled.guards.contains_key(&GuardKey {
+            state_id: "start".into(),
+            event_type: "done".into(),
+            transition_index: 1,
+        }));
     }
 
     // ── E4: data_schema guard reference validation ────────────────────────────

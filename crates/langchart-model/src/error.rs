@@ -96,15 +96,6 @@ pub enum DiagnosticLocation {
 pub enum CompileError {
     #[error("validation failed with {0} error(s)")]
     ValidationFailed(usize),
-
-    #[error(
-        "guard compilation failed in transition `{transition_id}` of state `{state_id}`: {source}"
-    )]
-    GuardCompile {
-        state_id: StateId,
-        transition_id: TransitionId,
-        source: crate::error::GuardError,
-    },
 }
 
 /// Errors from CEL guard compilation or evaluation.

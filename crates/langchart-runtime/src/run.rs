@@ -47,7 +47,7 @@ use langchart_model::{
     id::{EventId, InvocationId, RegionId, RunId, StateId},
     policy::{CapabilityPolicy, ContextPolicy, McpServerPolicy},
     state::{ParallelCompletion, StateDefinition, StateType, TransitionKind, TransitionSpec},
-    validation::CompiledWorkflow,
+    validation::{CompiledWorkflow, GuardKey},
     workflow::AgentDefinition,
 };
 use serde::{Deserialize, Serialize};
@@ -832,12 +832,21 @@ impl WorkflowInstance {
                 {
                     // Found a transition at this level — evaluate guards and
                     // stop climbing for this leaf (first matching ancestor wins).
-                    for spec in specs {
-                        let guard_ok = spec
-                            .guard
-                            .as_deref()
-                            .map(|g| self.evaluate_guard(g, event))
-                            .unwrap_or(true);
+                    for (transition_index, spec) in specs.iter().enumerate() {
+                        let guard_ok = if spec.guard.is_some() {
+                            let key = GuardKey {
+                                state_id: probe_id.clone(),
+                                event_type: event.event_type.clone(),
+                                transition_index,
+                            };
+                            self.workflow
+                                .guards
+                                .get(&key)
+                                .map(|guard| self.evaluate_guard(guard, event))
+                                .unwrap_or(false)
+                        } else {
+                            true
+                        };
 
                         if guard_ok {
                             // Position in active_states for stable tiebreaking.
@@ -891,15 +900,12 @@ impl WorkflowInstance {
         find_parallel_region_key_in(&self.workflow.document.states, target)
     }
 
-    fn evaluate_guard(&self, expr: &str, event: &QueuedEvent) -> bool {
-        use cel_interpreter::{Context, Program};
-
-        let Ok(program) = Program::compile(expr) else {
-            warn!(run = %self.run_id, expr = %expr, "guard compile failed at eval time");
-            return false;
-        };
-
-        let mut ctx = Context::default();
+    fn evaluate_guard(
+        &self,
+        guard: &langchart_model::guard::CompiledGuard,
+        event: &QueuedEvent,
+    ) -> bool {
+        let mut ctx = langchart_model::guard::evaluation_context();
 
         // ── B5: Runtime context variables ─────────────────────────────────────
         // Inject well-known runtime variables so guards can inspect run state:
@@ -936,10 +942,7 @@ impl WorkflowInstance {
             }
         }
 
-        match program.execute(&ctx) {
-            Ok(cel_interpreter::objects::Value::Bool(b)) => b,
-            _ => false,
-        }
+        guard.evaluate(&ctx).unwrap_or(false)
     }
 
     fn resolve_agent_input(&self, state_id: &StateId) -> Result<ron::Value, EngineError> {
