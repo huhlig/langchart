@@ -1107,7 +1107,7 @@ mod tests {
     use crate::{
         artifact::{ArtifactError, ProposalSummary},
         event::EventSinkError,
-        llm::LlmError,
+        llm::{FinishReason, LlmError, TokenUsage},
         mcp::{McpError, ToolDefinition},
         memory::{MemoryError, MemoryId, MemoryRecord, MemoryScope},
         secrets::{HostMapSecretsAdapter, SecretValue},
@@ -1115,8 +1115,9 @@ mod tests {
     use async_trait::async_trait;
     use langchart_model::{
         id::SecretRef,
-        policy::{McpServerPolicy, OperationClass},
+        policy::{McpServerPolicy, ModelPolicy, OperationClass},
     };
+    use proptest::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
@@ -1126,6 +1127,31 @@ mod tests {
     impl LlmAdapter for NoopLlm {
         async fn complete(&self, _request: LlmRequest) -> Result<LlmResponse, LlmError> {
             Err(LlmError::Provider("unused".into()))
+        }
+    }
+
+    struct RecordingLlm {
+        calls: Arc<AtomicUsize>,
+        tokens_per_call: u32,
+    }
+
+    #[async_trait]
+    impl LlmAdapter for RecordingLlm {
+        async fn complete(&self, _request: LlmRequest) -> Result<LlmResponse, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LlmResponse {
+                content: Some("ok".into()),
+                tool_calls: Vec::new(),
+                usage: TokenUsage {
+                    prompt_tokens: self.tokens_per_call,
+                    completion_tokens: 0,
+                    total_tokens: self.tokens_per_call,
+                },
+                finish_reason: FinishReason::Stop,
+                refusal: None,
+                model: "test-model".into(),
+                reported_model: None,
+            })
         }
     }
 
@@ -1447,6 +1473,164 @@ mod tests {
             2,
             3,
         )
+    }
+
+    fn llm_request() -> LlmRequest {
+        LlmRequest {
+            model_policy: ModelPolicy::default(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            response_format: Default::default(),
+        }
+    }
+
+    fn broker_with_recording_llm(tokens_per_call: u32) -> (CapabilityBroker, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let broker = CapabilityBroker::new(
+            Arc::new(RecordingLlm {
+                calls: calls.clone(),
+                tokens_per_call,
+            }),
+            Arc::new(RecordingMcp::default()),
+            Arc::new(NoopMemory),
+            Arc::new(HostMapSecretsAdapter::empty()),
+            Arc::new(RecordingSink::default()),
+        );
+        (broker, calls)
+    }
+
+    proptest! {
+        #[test]
+        fn turn_budget_never_admits_more_than_the_limit(
+            max_turns in 0_u32..20,
+            attempts in 0_u32..40,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (broker, calls) = broker_with_recording_llm(0);
+                let mut envelope = CapabilityEnvelope::new(
+                    CapabilityPolicy::default(),
+                    RunId::new("run-turn-prop"),
+                    InvocationId::new("inv-turn-prop"),
+                    StateId::new("work"),
+                    max_turns,
+                    0,
+                );
+                let _lease = broker.bind_envelope(&mut envelope);
+
+                for _ in 0..attempts {
+                    let _ = broker.call_llm(&mut envelope, llm_request()).await;
+                }
+
+                let admitted = attempts.min(max_turns);
+                prop_assert_eq!(calls.load(Ordering::SeqCst), admitted as usize);
+                prop_assert_eq!(envelope.turns_remaining(), max_turns - admitted);
+                Ok(())
+            })?;
+        }
+
+        #[test]
+        fn token_budget_blocks_calls_after_the_limit_is_reached(
+            limit in 0_u32..200,
+            tokens_per_call in 1_u32..25,
+            attempts in 0_u32..40,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (broker, calls) = broker_with_recording_llm(tokens_per_call);
+                let mut envelope = CapabilityEnvelope::new(
+                    CapabilityPolicy::default(),
+                    RunId::new("run-token-prop"),
+                    InvocationId::new("inv-token-prop"),
+                    StateId::new("work"),
+                    attempts.saturating_add(1),
+                    0,
+                )
+                .with_token_budget(Some(limit));
+                let _lease = broker.bind_envelope(&mut envelope);
+
+                for _ in 0..attempts {
+                    let _ = broker.call_llm(&mut envelope, llm_request()).await;
+                }
+
+                let admitted = if limit == 0 {
+                    0
+                } else {
+                    attempts.min(limit.div_ceil(tokens_per_call))
+                };
+                prop_assert_eq!(calls.load(Ordering::SeqCst), admitted as usize);
+                prop_assert_eq!(envelope.tokens_used(), admitted * tokens_per_call);
+                prop_assert_eq!(
+                    envelope.tokens_remaining(),
+                    Some(limit.saturating_sub(admitted * tokens_per_call)),
+                );
+                Ok(())
+            })?;
+        }
+
+        #[test]
+        fn tool_budgets_enforce_global_and_per_server_limits(
+            global_limit in 0_u32..20,
+            server_limit in 0_u32..20,
+            attempts in 0_u32..40,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let server = ServerId::new("server-budget-prop");
+                let tool = ToolName::new("tool-budget-prop");
+                let policy = CapabilityPolicy {
+                    mcp: HashMap::from([(
+                        server.clone(),
+                        McpServerPolicy {
+                            allow: vec![tool.clone()],
+                            call_budget: Some(server_limit),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                };
+                let (broker, mcp, _) = broker(HashMap::new());
+                let mut envelope = CapabilityEnvelope::new(
+                    policy,
+                    RunId::new("run-tool-prop"),
+                    InvocationId::new("inv-tool-prop"),
+                    StateId::new("work"),
+                    0,
+                    global_limit,
+                );
+                let _lease = broker.bind_envelope(&mut envelope);
+
+                for _ in 0..attempts {
+                    let _ = broker
+                        .call_tool(
+                            &mut envelope,
+                            &server,
+                            &tool,
+                            serde_json::Value::Null,
+                            None,
+                        )
+                        .await;
+                }
+
+                let admitted = attempts.min(global_limit).min(server_limit);
+                prop_assert_eq!(mcp.calls.load(Ordering::SeqCst), admitted as usize);
+                prop_assert_eq!(envelope.tool_calls_remaining(), global_limit - admitted);
+                prop_assert_eq!(
+                    envelope.server_tool_calls_remaining().get(&server),
+                    Some(&(server_limit - admitted)),
+                );
+                Ok(())
+            })?;
+        }
     }
 
     #[test]

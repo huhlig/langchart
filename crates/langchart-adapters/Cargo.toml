@@ -23,4 +23,5 @@ chrono           = { version = "0.4", features = ["serde"] }
 regex            = "1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+tokio    = { workspace = true, features = ["full"] }
+proptest = { workspace = true }
