@@ -331,9 +331,9 @@ fn check_transition_priority_ties(state: &StateDefinition, diags: &mut Vec<Diagn
     // A tie occurs when two or more transitions on the same event in the same state
     // share the same priority value.
     for (event_type, specs) in &state.on {
-        let mut seen_priorities: Vec<i32> = Vec::new();
+        let mut seen_priorities = HashSet::new();
         for spec in specs {
-            if seen_priorities.contains(&spec.priority) {
+            if !seen_priorities.insert(spec.priority) {
                 let tid = TransitionId::new(format!("{}_on_{}", state.id, event_type));
                 diags.push(Diagnostic::error(
                     "E011",
@@ -347,7 +347,6 @@ fn check_transition_priority_ties(state: &StateDefinition, diags: &mut Vec<Diagn
                 // Report once per tie group, not once per extra duplicate.
                 break;
             }
-            seen_priorities.push(spec.priority);
         }
     }
 }
