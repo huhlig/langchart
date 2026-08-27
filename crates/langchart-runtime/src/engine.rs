@@ -9,7 +9,7 @@
 //! engine thread-safe and allows many runs to proceed concurrently.
 
 use crate::{
-    broker::CapabilityBroker,
+    broker::{BrokerRuntimeAuthority, CapabilityBroker},
     run::{InstanceCheckpoint, RunStatus, WorkflowInstance},
 };
 use langchart_adapters::{
@@ -105,6 +105,7 @@ pub struct EngineAdapters {
 /// ```
 pub struct RuntimeEngine {
     broker: Arc<CapabilityBroker>,
+    broker_authority: BrokerRuntimeAuthority,
     /// Optional checkpoint store — shared by all runs created by this engine.
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
     /// Optional workflow repository for subworkflow resolution.
@@ -122,27 +123,30 @@ pub struct RuntimeEngine {
 impl RuntimeEngine {
     pub fn new(adapters: EngineAdapters) -> Self {
         let broker = if let Some(art) = adapters.artifact_store {
-            Arc::new(
-                CapabilityBroker::new(
-                    adapters.llm,
-                    adapters.mcp,
-                    adapters.memory,
-                    adapters.secrets,
-                    adapters.event_sink,
-                )
-                .with_artifact_store(art),
-            )
-        } else {
-            Arc::new(CapabilityBroker::new(
+            CapabilityBroker::new(
                 adapters.llm,
                 adapters.mcp,
                 adapters.memory,
                 adapters.secrets,
                 adapters.event_sink,
-            ))
+            )
+            .with_artifact_store(art)
+        } else {
+            CapabilityBroker::new(
+                adapters.llm,
+                adapters.mcp,
+                adapters.memory,
+                adapters.secrets,
+                adapters.event_sink,
+            )
         };
+        let broker_authority = broker
+            .claim_runtime_authority()
+            .expect("new broker must provide runtime authority");
+        let broker = Arc::new(broker);
         Self {
             broker,
+            broker_authority,
             checkpoint_store: adapters.checkpoint_store,
             workflow_repo: adapters.workflow_repo,
             event_source: adapters.event_source,
@@ -198,12 +202,14 @@ impl RuntimeEngine {
         // Each run gets its own event sink wrapper that also records to the
         // engine's observable sink.
         let event_sink = self.broker.event_sink_ref();
-        let mut instance = WorkflowInstance::new(
+        let mut instance = WorkflowInstance::with_actions_and_broker_authority(
             run_id.clone(),
             compiled,
             self.broker.clone(),
+            self.broker_authority.clone(),
             event_sink,
             actors,
+            HashMap::new(),
         );
         if let Some(store) = &self.checkpoint_store {
             instance = instance.with_checkpoint_store(store.clone());
@@ -365,12 +371,14 @@ impl RuntimeEngine {
         info!(run = %run_id, workflow = %ck.workflow_id, "recovering run from checkpoint");
 
         let event_sink = self.broker.event_sink_ref();
-        let mut instance = WorkflowInstance::new(
+        let mut instance = WorkflowInstance::with_actions_and_broker_authority(
             ck.run_id.clone(),
             compiled,
             self.broker.clone(),
+            self.broker_authority.clone(),
             event_sink,
             actors,
+            HashMap::new(),
         );
         if let Some(ck_store) = &self.checkpoint_store {
             instance = instance.with_checkpoint_store(ck_store.clone());
@@ -608,4 +616,10 @@ pub enum EngineError {
 
     #[error("run is cancelled")]
     Cancelled,
+}
+
+impl From<langchart_adapters::broker::BrokerError> for EngineError {
+    fn from(error: langchart_adapters::broker::BrokerError) -> Self {
+        Self::Broker(error.to_string())
+    }
 }

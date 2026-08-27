@@ -380,6 +380,25 @@ async fn broker_rejects_a_forged_capability_envelope() {
 
     let sink = Arc::new(VecSink::default());
     let broker = bare_broker(sink.clone());
+    let compiled = Arc::new(
+        compile(base_doc(
+            "forged-envelope",
+            vec![leaf_state("idle", StateType::Atomic)],
+            "idle",
+        ))
+        .expect("compile"),
+    );
+    let _instance = WorkflowInstance::new(
+        RunId::new("r-forged-envelope"),
+        compiled,
+        broker.clone(),
+        sink,
+        HashMap::new(),
+    );
+    assert!(
+        broker.claim_runtime_authority().is_none(),
+        "the instance must consume the broker's runtime authority"
+    );
     let server = ServerId::new("vault");
     let envelope = CapabilityEnvelope::new(
         CapabilityPolicy {

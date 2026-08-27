@@ -92,7 +92,7 @@ let compiled = compile(doc)?;  // fails if there are errors
 ```rust
 use async_trait::async_trait;
 use langchart_runtime::instance::{AgentActor, AgentError, AgentInvocation, AgentOutputEvent};
-use langchart_runtime::broker::CapabilityBroker;
+use langchart_adapters::broker::CapabilityBroker;
 use std::sync::Arc;
 
 pub struct Greeter;

@@ -1,7 +1,7 @@
 //! # langchart-adapters
 //!
-//! Pure adapter trait definitions for all external integrations.
-//! No concrete implementations are provided here.
+//! Adapter contracts and the policy-enforcing capability broker for external
+//! integrations. Concrete external-system implementations live in separate crates.
 //!
 //! Every external system the engine touches is abstracted through one of
 //! these traits. The runtime depends only on these traits; concrete adapter
@@ -22,6 +22,7 @@
 
 pub mod artifact;
 pub mod broadcast;
+pub mod broker;
 pub mod checkpoint;
 pub mod context;
 pub mod event;

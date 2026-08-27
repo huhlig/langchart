@@ -531,9 +531,9 @@ or an equivalent declared failure event. If the actor is cancelled (timeout), th
 This model allows existing agent frameworks (LangChain, custom ReAct loops, etc.) to be wrapped as actor
 implementations with minimal adapter code.
 
-The `AgentActor` trait is defined in **`langchart-runtime`** (not `langchart-adapters`) because the trait
-receives a reference to `CapabilityBroker`, which is a runtime type. Actor implementors add `langchart-runtime`
-as a dependency. See §14 for the `AgentActor` trait signature.
+The `AgentActor` trait is defined in **`langchart-runtime`** because the runtime owns actor invocation and
+cancellation. It receives the `CapabilityBroker` from `langchart-adapters`, where external-system contracts
+and their common policy-enforcement boundary live. See §14 for the `AgentActor` trait signature.
 
 ### 9.2 Reusable Agent Definition
 
@@ -995,7 +995,8 @@ secrets manager by implementing the trait.
 
 ### 14.8 Agent Actor Trait
 
-`AgentActor` is defined in **`langchart-runtime`** because it requires a reference to `CapabilityBroker`:
+`AgentActor` is defined in **`langchart-runtime`** and uses the `CapabilityBroker` from
+**`langchart-adapters`**:
 
 ```rust
 #[async_trait]
@@ -1024,8 +1025,9 @@ pub struct AgentInvocation {
 
 ### 14.9 Capability Broker
 
-The `CapabilityBroker` is not a simple adapter — it is a core runtime component that holds references to the
-LLM, MCP, memory, and secrets adapters and enforces policy on every call:
+The `CapabilityBroker` lives in **`langchart-adapters`** alongside the contracts it wraps. It holds references
+to the LLM, MCP, memory, secrets, event, and optional artifact adapters and enforces policy on every call.
+`langchart-runtime::broker` is a compatibility re-export, not a second implementation:
 
 ```rust
 pub struct CapabilityBroker {
@@ -1357,15 +1359,15 @@ langchart/                        (workspace root)
 │   ├─ langchart-model/           Core types, schema, validation, CEL guards
 │   │                             WASM-compatible. No I/O, no async runtime.
 │   │
-│   ├─ langchart-adapters/        Adapter traits only (no implementations)
+│   ├─ langchart-adapters/        Integration contracts and capability broker
 │   │                             LlmAdapter, McpAdapter, MemoryAdapter,
 │   │                             ArtifactStore, CheckpointStore,
-│   │                             EventSink, EventSource
+│   │                             EventSink, EventSource, CapabilityBroker
 │   │                             Depends on: langchart-model
 │   │
 │   ├─ langchart-runtime/         Async execution engine
-│   │                             CapabilityBroker, RuntimeEngine,
-│   │                             event loop, checkpointing, timers
+│   │                             RuntimeEngine, event loop,
+│   │                             checkpointing, timers
 │   │                             Depends on: langchart-model, langchart-adapters
 │   │
 │   ├─ langchart-context/         ContextResolverChain and built-in stages
@@ -1519,7 +1521,7 @@ to this workflow's artifact and tool abstractions.
 
 | # | Decision | Resolution |
 |---|---|---|
-| 1 | `AgentActor` trait location | Defined in **`langchart-runtime`**. The trait requires a reference to the `CapabilityBroker`, which lives in runtime. Placing it in adapters would create a circular dependency or require an awkward re-export. Actor implementors depend on `langchart-runtime` directly. |
+| 1 | `AgentActor` trait location | Defined in **`langchart-runtime`**, which owns invocation and cancellation. `CapabilityBroker` lives in **`langchart-adapters`** and is re-exported from `langchart-runtime::broker` for compatibility. Actor implementors may keep depending on `langchart-runtime`. |
 | 2 | CEL extension functions | **Opt-in whitelist.** A `CelExtensions` registry in `langchart-model` holds named pure functions approved for use in guards. The whitelist is enforced at CEL compilation time. Side-effectful or I/O functions are permanently excluded. The initial whitelist is: `version_gte`, `version_lte`, `contains_all`, `contains_any`, `is_empty`. |
 | 3 | Workflow data schema | **Typed via RON.** Workflow data fields are declared with explicit types in the workflow document using RON (Rusty Object Notation) syntax for type signatures. RON integrates naturally with Rust's type system, supports enums and structs, and round-trips cleanly without JSON's stringly-typed limitations. The declared schema is used for static CEL guard type-checking and runtime deserialization. |
 | 4 | Event ordering in parallel regions | **Stable (deterministic).** Events emitted from parallel regions are ordered by region declaration order, then by emission timestamp (ULID monotonic). This guarantees deterministic replay and makes test assertions stable. |

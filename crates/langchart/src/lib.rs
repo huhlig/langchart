@@ -12,8 +12,8 @@
 //! ```text
 //! langchart
 //!   ├── model     — workflow types, validation, CEL guards (re-exported)
-//!   ├── adapters  — integration trait definitions (re-exported)
-//!   ├── runtime   — execution engine and capability broker (re-exported)
+//!   ├── adapters  — integration contracts and capability broker (re-exported)
+//!   ├── runtime   — execution engine (re-exported)
 //!   └── context   — context resolver chain (re-exported)
 //! ```
 //!

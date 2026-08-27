@@ -28,7 +28,7 @@
 //!   event (with the child's final output) is injected into the parent's queue.
 
 use crate::{
-    broker::{CapabilityBroker, CapabilityEnvelope, InvocationLease},
+    broker::{BrokerRuntimeAuthority, CapabilityBroker, CapabilityEnvelope, InvocationLease},
     engine::EngineError,
     instance::{
         ActionContext, ActionTrigger, AgentActor, AgentError, AgentOutputEvent,
@@ -239,6 +239,7 @@ pub struct WorkflowInstance {
 
     // Adapters.
     broker: Arc<CapabilityBroker>,
+    broker_authority: BrokerRuntimeAuthority,
     event_sink: Arc<dyn EventSink>,
 
     // Optional deployment-wide ceiling applied before workflow capabilities.
@@ -316,6 +317,32 @@ impl WorkflowInstance {
         actors: HashMap<StateId, Arc<dyn AgentActor>>,
         action_registry: HashMap<String, Arc<dyn StateAction>>,
     ) -> Self {
+        let broker_authority = broker
+            .claim_runtime_authority()
+            .expect("broker runtime authority was already claimed; use the authorized constructor");
+        Self::with_actions_and_broker_authority(
+            run_id,
+            workflow,
+            broker,
+            broker_authority,
+            event_sink,
+            actors,
+            action_registry,
+        )
+    }
+
+    /// Construct an instance with authority retained by a shared runtime.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_actions_and_broker_authority(
+        run_id: RunId,
+        workflow: Arc<CompiledWorkflow>,
+        broker: Arc<CapabilityBroker>,
+        broker_authority: BrokerRuntimeAuthority,
+        event_sink: Arc<dyn EventSink>,
+        actors: HashMap<StateId, Arc<dyn AgentActor>>,
+        action_registry: HashMap<String, Arc<dyn StateAction>>,
+    ) -> Self {
         let (activity_tx, activity_rx) = mpsc::unbounded_channel();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         let timers = TimerRegistry::new(run_id.clone(), timer_tx.clone());
@@ -339,6 +366,7 @@ impl WorkflowInstance {
             timers,
             outbox: Outbox::new(),
             broker,
+            broker_authority,
             event_sink,
             deployment_capabilities: None,
             actors,
@@ -1710,7 +1738,9 @@ impl WorkflowInstance {
             limits.max_tool_calls,
         )
         .with_token_budget(limits.max_tokens_total);
-        let lease = self.broker.authorize_envelope(&mut envelope);
+        let lease = self
+            .broker
+            .authorize_envelope(&self.broker_authority, &mut envelope)?;
 
         // ── C1: Context resolution ────────────────────────────────────────────
         // If a ContextResolver was injected, call it now to assemble the
@@ -1842,6 +1872,7 @@ impl WorkflowInstance {
         let sid = state_id.clone();
         let wref = workflow_ref.clone();
         let broker = self.broker.clone();
+        let broker_authority = self.broker_authority.clone();
         let event_sink = self.event_sink.clone();
         let parent_run_id = self.run_id.clone();
         let repo = self.workflow_repo.clone();
@@ -1875,12 +1906,14 @@ impl WorkflowInstance {
             let child_run_id =
                 langchart_model::id::RunId::new(format!("{}::{}", parent_run_id, sid));
 
-            let mut child = crate::run::WorkflowInstance::new(
+            let mut child = crate::run::WorkflowInstance::with_actions_and_broker_authority(
                 child_run_id,
                 child_wf.clone(),
                 broker,
+                broker_authority,
                 event_sink,
                 actors,
+                HashMap::new(),
             );
             if let Some(policy) = deployment_capabilities {
                 child = child.with_deployment_capabilities(policy);

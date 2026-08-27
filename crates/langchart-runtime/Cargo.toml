@@ -1,6 +1,6 @@
 [package]
 name        = "langchart-runtime"
-description = "Async statechart execution engine: event loop, capability broker, checkpointing, timers, and cancellation."
+description = "Async statechart execution engine: event loop, checkpointing, timers, and cancellation."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true

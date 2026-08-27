@@ -1,6 +1,6 @@
 [package]
 name        = "langchart-adapters"
-description = "Adapter traits for LLM, MCP, Memory, ArtifactStore, CheckpointStore, and EventSink. No implementations."
+description = "External integration contracts and the policy-enforcing capability broker."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -17,6 +17,10 @@ futures          = { workspace = true }
 time             = { workspace = true }
 tokio            = { workspace = true, features = ["sync"] }
 tokio-stream     = { version = "0.1", features = ["sync"] }
+tracing          = { workspace = true }
+ulid             = { workspace = true }
+chrono           = { version = "0.4", features = ["serde"] }
+regex            = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
