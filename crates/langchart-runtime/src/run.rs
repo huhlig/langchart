@@ -288,6 +288,9 @@ pub struct WorkflowInstance {
     // Optional run-time workflow data (RON-typed). When present, top-level
     // fields are exposed as `data.<field>` variables in CEL guard expressions.
     workflow_data: Option<ron::Value>,
+
+    // The causal event that transitioned this run into a top-level final state.
+    completion_event: Option<AgentOutputEvent>,
 }
 
 impl WorkflowInstance {
@@ -343,6 +346,7 @@ impl WorkflowInstance {
             context_resolver: None,
             checkpoint_store: None,
             workflow_data: None,
+            completion_event: None,
         }
     }
 
@@ -762,6 +766,13 @@ impl WorkflowInstance {
             }
         }
 
+        if self.status == RunStatus::Completed && self.completion_event.is_none() {
+            self.completion_event = Some(AgentOutputEvent {
+                event_type: event.event_type,
+                payload: event.payload,
+            });
+        }
+
         Ok(())
     }
 
@@ -952,12 +963,20 @@ impl WorkflowInstance {
     }
 
     fn resolve_agent_input(&self, state_id: &StateId) -> Result<ron::Value, EngineError> {
-        use cel_interpreter::{Context, Program};
-
         let bindings = self
             .find_state_def(state_id)
             .map(|state| state.input.clone())
             .unwrap_or_default();
+        self.resolve_workflow_bindings(state_id, &bindings)
+    }
+
+    fn resolve_workflow_bindings(
+        &self,
+        state_id: &StateId,
+        bindings: &HashMap<String, String>,
+    ) -> Result<ron::Value, EngineError> {
+        use cel_interpreter::{Context, Program};
+
         let workflow_json = self
             .workflow_data
             .as_ref()
@@ -997,12 +1016,12 @@ impl WorkflowInstance {
                     })?
                     .json()
                     .map_err(|error| EngineError::Serialization(error.to_string()))?
-            } else if let Some(value) = workflow_json.get(&binding) {
+            } else if let Some(value) = workflow_json.get(binding) {
                 value.clone()
             } else {
-                serde_json::Value::String(binding)
+                serde_json::Value::String(binding.clone())
             };
-            resolved.insert(field, value);
+            resolved.insert(field.clone(), value);
         }
 
         serde_json::from_value(serde_json::Value::Object(resolved))
@@ -1742,6 +1761,11 @@ impl WorkflowInstance {
                 )));
             }
         };
+        let child_input = def
+            .ports
+            .as_ref()
+            .map(|ports| self.resolve_workflow_bindings(state_id, &ports.input))
+            .transpose()?;
 
         self.emit(RuntimeEventPayload::SubworkflowStarted {
             state_id: state_id.clone(),
@@ -1759,6 +1783,7 @@ impl WorkflowInstance {
         let event_sink = self.event_sink.clone();
         let parent_run_id = self.run_id.clone();
         let repo = self.workflow_repo.clone();
+        let actors = self.actors.clone();
         let iid = invocation_id;
 
         let handle = tokio::spawn(async move {
@@ -1789,11 +1814,34 @@ impl WorkflowInstance {
 
             let mut child = crate::run::WorkflowInstance::new(
                 child_run_id,
-                child_wf,
+                child_wf.clone(),
                 broker,
                 event_sink,
-                std::collections::HashMap::new(), // no actor overrides for child
+                actors,
             );
+            let input_json = child_input
+                .as_ref()
+                .and_then(|input| serde_json::to_value(input).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(required) = child_wf
+                .document
+                .inputs
+                .iter()
+                .find(|port| port.required && input_json.get(&port.name).is_none())
+            {
+                let _ = tx.send(ActivityResult::SubworkflowFailed {
+                    state_id: sid,
+                    invocation_id: iid.clone(),
+                    message: format!(
+                        "required child input port `{}` has no binding",
+                        required.name
+                    ),
+                });
+                return;
+            }
+            if let Some(input) = child_input {
+                child = child.with_workflow_data(input);
+            }
 
             if let Err(e) = child.start().await {
                 let _ = tx.send(ActivityResult::SubworkflowFailed {
@@ -1808,15 +1856,15 @@ impl WorkflowInstance {
 
             match result {
                 Ok(crate::run::RunStatus::Completed) => {
-                    // The child's last emitted output event is synthesised as
-                    // the subworkflow completion payload. We report a generic
-                    // "subworkflow.completed" event; the host can inspect the
-                    // child run's event log for richer data.
+                    let output = child.completion_event.take().unwrap_or(AgentOutputEvent {
+                        event_type: "completed".into(),
+                        payload: serde_json::json!({}),
+                    });
                     let _ = tx.send(ActivityResult::SubworkflowCompleted {
                         state_id: sid,
                         invocation_id: iid.clone(),
-                        output_event_type: "subworkflow.completed".into(),
-                        output_payload: serde_json::json!({}),
+                        output_event_type: output.event_type,
+                        output_payload: output.payload,
                     });
                 }
                 Ok(other) => {
@@ -2039,17 +2087,34 @@ impl WorkflowInstance {
                 if !self.take_active_invocation(&state_id, &invocation_id) {
                     return Ok(());
                 }
-                self.emit(RuntimeEventPayload::SubworkflowCompleted {
-                    state_id: state_id.clone(),
-                })
-                .await?;
-                // Inject the child workflow's output event into the parent queue.
-                self.queue_activity_event(
-                    state_id,
-                    invocation_id,
-                    output_event_type,
-                    output_payload,
-                );
+                match self.map_subworkflow_output(&state_id, &output_event_type, &output_payload) {
+                    Ok((parent_event_type, parent_payload)) => {
+                        self.emit(RuntimeEventPayload::SubworkflowCompleted {
+                            state_id: state_id.clone(),
+                        })
+                        .await?;
+                        self.queue_activity_event(
+                            state_id,
+                            invocation_id,
+                            parent_event_type,
+                            parent_payload,
+                        );
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.emit(RuntimeEventPayload::SubworkflowFailed {
+                            state_id: state_id.clone(),
+                            message: message.clone(),
+                        })
+                        .await?;
+                        self.queue_activity_event(
+                            state_id,
+                            invocation_id,
+                            "subworkflow.failed".into(),
+                            serde_json::json!({ "error": message }),
+                        );
+                    }
+                }
             }
             ActivityResult::SubworkflowFailed {
                 state_id,
@@ -2085,6 +2150,92 @@ impl WorkflowInstance {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn map_subworkflow_output(
+        &mut self,
+        state_id: &StateId,
+        child_event_type: &str,
+        child_payload: &serde_json::Value,
+    ) -> Result<(String, serde_json::Value), EngineError> {
+        use cel_interpreter::{Context, Program};
+
+        let output_ports = self
+            .find_state_def(state_id)
+            .and_then(|state| state.ports.as_ref())
+            .map(|ports| ports.output.clone())
+            .unwrap_or_default();
+        if output_ports.is_empty() {
+            return Ok(("subworkflow.completed".into(), serde_json::json!({})));
+        }
+
+        let bindings = output_ports.get(child_event_type).ok_or_else(|| {
+            EngineError::Activity(format!(
+                "subworkflow state `{state_id}` has no output mapping for child event `{child_event_type}`"
+            ))
+        })?;
+        let workflow_json = self
+            .workflow_data
+            .as_ref()
+            .and_then(|data| serde_json::to_value(data).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let event_json = serde_json::json!({ "payload": child_payload });
+        let mut mapped = serde_json::Map::new();
+
+        for (field, binding) in bindings {
+            let value = if let Some(expression) = binding
+                .strip_prefix("${")
+                .and_then(|value| value.strip_suffix('}'))
+            {
+                let program = Program::compile(expression).map_err(|error| {
+                    EngineError::Activity(format!(
+                        "invalid output binding `{binding}` for state `{state_id}`: {error}"
+                    ))
+                })?;
+                let mut context = Context::default();
+                context
+                    .add_variable(
+                        "event",
+                        cel_interpreter::to_value(&event_json)
+                            .map_err(|error| EngineError::Serialization(error.to_string()))?,
+                    )
+                    .map_err(|error| EngineError::Activity(error.to_string()))?;
+                context
+                    .add_variable(
+                        "workflow",
+                        cel_interpreter::to_value(&workflow_json)
+                            .map_err(|error| EngineError::Serialization(error.to_string()))?,
+                    )
+                    .map_err(|error| EngineError::Activity(error.to_string()))?;
+                program
+                    .execute(&context)
+                    .map_err(|error| {
+                        EngineError::Activity(format!(
+                            "output binding `{binding}` failed for state `{state_id}`: {error}"
+                        ))
+                    })?
+                    .json()
+                    .map_err(|error| EngineError::Serialization(error.to_string()))?
+            } else {
+                serde_json::Value::String(binding.clone())
+            };
+            mapped.insert(field.clone(), value);
+        }
+
+        let mut parent_data = workflow_json;
+        let parent_object = parent_data.as_object_mut().ok_or_else(|| {
+            EngineError::Activity("parent workflow data must be an object".into())
+        })?;
+        parent_object.extend(mapped.clone());
+        self.workflow_data = Some(
+            serde_json::from_value(parent_data)
+                .map_err(|error| EngineError::Serialization(error.to_string()))?,
+        );
+
+        Ok((
+            format!("subworkflow.{child_event_type}"),
+            serde_json::Value::Object(mapped),
+        ))
+    }
 
     fn queue_activity_event(
         &mut self,

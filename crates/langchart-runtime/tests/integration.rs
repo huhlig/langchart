@@ -1539,6 +1539,213 @@ async fn subworkflow_resolves_and_completes() {
     );
 }
 
+#[tokio::test]
+async fn subworkflow_ports_transfer_input_and_mapped_output() {
+    use langchart_adapters::workflow_repository::{InMemoryWorkflowRepository, WorkflowRepository};
+    use langchart_model::{state::PortBinding, workflow::InputPort};
+
+    struct ChildActor {
+        captured_input: Arc<Mutex<Option<ron::Value>>>,
+    }
+
+    #[async_trait]
+    impl AgentActor for ChildActor {
+        async fn run(
+            &self,
+            invocation: langchart_runtime::instance::AgentInvocation,
+            _envelope: langchart_runtime::broker::CapabilityEnvelope,
+            _broker: Arc<CapabilityBroker>,
+        ) -> Result<
+            langchart_runtime::instance::AgentOutputEvent,
+            langchart_runtime::instance::AgentError,
+        > {
+            *self.captured_input.lock().await = Some(invocation.input);
+            Ok(langchart_runtime::instance::AgentOutputEvent {
+                event_type: "approved".into(),
+                payload: serde_json::json!({
+                    "issues": ["missing citation"],
+                    "approved": true
+                }),
+            })
+        }
+    }
+
+    let mut child_step = leaf_state("child_step", StateType::Agentic);
+    child_step.agent = Some(AgentRef {
+        id: AgentId::new("child-agent"),
+        version: AgentVersion::new("1.0.0"),
+    });
+    child_step
+        .input
+        .insert("draft".into(), "${workflow.draft_version}".into());
+    child_step = with_transition(child_step, "approved", "child_end", None);
+    let mut child_doc = base_doc(
+        "mapped-child",
+        vec![child_step, leaf_state("child_end", StateType::Final)],
+        "child_step",
+    );
+    child_doc.inputs.push(InputPort {
+        name: "draft_version".into(),
+        type_sig: "String".into(),
+        required: true,
+        description: None,
+    });
+    let child_compiled = Arc::new(compile(child_doc).expect("compile child"));
+    let repo: Arc<dyn WorkflowRepository> =
+        Arc::new(InMemoryWorkflowRepository::new().register("mapped-child@1.0", child_compiled));
+
+    let mut run_child = leaf_state("run_child", StateType::Subworkflow);
+    run_child.workflow_ref = Some("mapped-child@1.0".into());
+    run_child.ports = Some(PortBinding {
+        input: HashMap::from([(
+            "draft_version".into(),
+            "${workflow.current_draft_version}".into(),
+        )]),
+        output: HashMap::from([(
+            "approved".into(),
+            HashMap::from([
+                ("issues".into(), "${event.payload.issues}".into()),
+                ("approved".into(), "${event.payload.approved}".into()),
+            ]),
+        )]),
+    });
+    run_child = with_transition(run_child, "subworkflow.approved", "done", None);
+    let parent_compiled = Arc::new(
+        compile(base_doc(
+            "mapped-parent",
+            vec![run_child, leaf_state("done", StateType::Final)],
+            "run_child",
+        ))
+        .expect("compile parent"),
+    );
+
+    let captured_input = Arc::new(Mutex::new(None));
+    let child_actor: Arc<dyn AgentActor> = Arc::new(ChildActor {
+        captured_input: captured_input.clone(),
+    });
+    let sink = Arc::new(VecSink::default());
+    let mut instance = WorkflowInstance::new(
+        RunId::new("r-subworkflow-ports"),
+        parent_compiled,
+        bare_broker(sink.clone()),
+        sink.clone(),
+        HashMap::from([(StateId::new("child_step"), child_actor)]),
+    )
+    .with_workflow_repo(repo)
+    .with_workflow_data(
+        serde_json::from_value(serde_json::json!({
+            "current_draft_version": "draft-v7"
+        }))
+        .unwrap(),
+    );
+
+    instance.start().await.expect("start");
+    for _ in 0..100 {
+        if instance.step().await.expect("step") {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(instance.status, RunStatus::Completed);
+    let child_input = serde_json::to_value(captured_input.lock().await.clone().unwrap()).unwrap();
+    assert_eq!(child_input, serde_json::json!({ "draft": "draft-v7" }));
+
+    let parent_data = serde_json::to_value(
+        instance
+            .take_checkpoint()
+            .workflow_data
+            .expect("parent workflow data"),
+    )
+    .unwrap();
+    assert_eq!(parent_data["current_draft_version"], "draft-v7");
+    assert_eq!(
+        parent_data["issues"],
+        serde_json::json!(["missing citation"])
+    );
+    assert_eq!(parent_data["approved"], true);
+    assert!(sink.payloads().await.iter().any(|payload| matches!(
+        payload,
+        RuntimeEventPayload::TransitionSelected {
+            event_type,
+            event_payload,
+            ..
+        } if event_type == "subworkflow.approved"
+            && event_payload["approved"] == true
+    )));
+}
+
+#[tokio::test]
+async fn subworkflow_missing_output_mapping_routes_to_failure() {
+    use langchart_adapters::workflow_repository::{InMemoryWorkflowRepository, WorkflowRepository};
+    use langchart_model::state::PortBinding;
+
+    let mut child_step = leaf_state("child_step", StateType::Agentic);
+    child_step.agent = Some(AgentRef {
+        id: AgentId::new("child-agent"),
+        version: AgentVersion::new("1.0.0"),
+    });
+    child_step = with_transition(child_step, "approved", "child_end", None);
+    let child_compiled = Arc::new(
+        compile(base_doc(
+            "unmapped-child",
+            vec![child_step, leaf_state("child_end", StateType::Final)],
+            "child_step",
+        ))
+        .expect("compile child"),
+    );
+    let repo: Arc<dyn WorkflowRepository> =
+        Arc::new(InMemoryWorkflowRepository::new().register("unmapped-child@1.0", child_compiled));
+
+    let mut run_child = leaf_state("run_child", StateType::Subworkflow);
+    run_child.workflow_ref = Some("unmapped-child@1.0".into());
+    run_child.ports = Some(PortBinding {
+        input: HashMap::new(),
+        output: HashMap::from([(
+            "rejected".into(),
+            HashMap::from([("reason".into(), "${event.payload.reason}".into())]),
+        )]),
+    });
+    run_child = with_transition(run_child, "subworkflow.failed", "recovered", None);
+    let parent_compiled = Arc::new(
+        compile(base_doc(
+            "unmapped-parent",
+            vec![run_child, leaf_state("recovered", StateType::Final)],
+            "run_child",
+        ))
+        .expect("compile parent"),
+    );
+
+    let child_actor: Arc<dyn AgentActor> = Arc::new(ScriptedAgentActor::emit(
+        "approved",
+        serde_json::json!({ "approved": true }),
+    ));
+    let sink = Arc::new(VecSink::default());
+    let mut instance = WorkflowInstance::new(
+        RunId::new("r-subworkflow-unmapped-output"),
+        parent_compiled,
+        bare_broker(sink.clone()),
+        sink.clone(),
+        HashMap::from([(StateId::new("child_step"), child_actor)]),
+    )
+    .with_workflow_repo(repo);
+
+    instance.start().await.expect("start");
+    for _ in 0..100 {
+        if instance.step().await.expect("step") {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(instance.status, RunStatus::Completed);
+    assert!(sink.payloads().await.iter().any(|payload| matches!(
+        payload,
+        RuntimeEventPayload::SubworkflowFailed { message, .. }
+            if message.contains("no output mapping for child event `approved`")
+    )));
+}
+
 /// 15. A subworkflow state with no repository still fails gracefully via
 ///     `SubworkflowFailed` (regression guard for the existing stub behaviour).
 #[tokio::test]

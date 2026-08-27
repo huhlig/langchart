@@ -48,7 +48,9 @@ pub struct AgentRef {
 pub struct PortBinding {
     /// `child_field_name → workflow-data expression` evaluated at invocation time.
     pub input: HashMap<String, String>,
-    /// Maps child output event type → field-level bindings written to caller data.
+    /// Maps the child's final-transition event type to field-level bindings.
+    /// Mapped fields are written to caller data and emitted as
+    /// `subworkflow.<child-event-type>`.
     pub output: HashMap<String, HashMap<String, String>>,
 }
 

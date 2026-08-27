@@ -296,12 +296,28 @@ A `subworkflow` state invokes another versioned workflow document resolved throu
   "id": "run-review",
   "type": "subworkflow",
   "workflow_ref": "content-review@1.0.0",
+  "ports": {
+    "input": {
+      "draft_version": "${workflow.current_draft_version}"
+    },
+    "output": {
+      "approved": {
+        "issues": "${event.payload.issues}",
+        "approved": "${event.payload.approved}"
+      }
+    }
+  },
   "on": {
-    "subworkflow.completed": [{ "target": "finalize", "priority": 0, "actions": [] }],
+    "subworkflow.approved":  [{ "target": "finalize", "priority": 0, "actions": [] }],
     "subworkflow.failed":    [{ "target": "recovery", "priority": 0, "actions": [] }]
   }
 }
 ```
+
+Input bindings initialize the child workflow's data. The event that transitions the child into its top-level final
+state selects the matching output map. Mapped fields are merged into the parent's workflow data and delivered in a
+`subworkflow.<child-event-type>` event. A subworkflow without output mappings retains the compatibility event
+`subworkflow.completed` with an empty payload.
 
 Wire the repository into the engine:
 

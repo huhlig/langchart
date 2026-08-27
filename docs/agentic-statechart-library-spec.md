@@ -395,7 +395,7 @@ ports:
     draft_version: ${workflow.current_draft_version}
     review_scope: full
   output:
-    on_completed:
+    approved:
       issues: ${event.payload.issues}
       approved: ${event.payload.approved}
 on:
@@ -408,8 +408,10 @@ on:
     target: recovery
 ```
 
-Input ports map workflow data expressions to the child workflow's typed input schema. Output ports map the child's
-final output event payload back to the parent's workflow data. Port schemas are validated statically.
+Input ports map workflow data expressions to the child workflow's typed input schema. Output ports are selected by
+the exact event that transitions the child into its top-level final state, then map that event payload back to the
+parent's workflow data. The parent receives the namespaced event `subworkflow.<child-event-type>`. Required child
+inputs are checked after the referenced workflow is resolved.
 
 ---
 
