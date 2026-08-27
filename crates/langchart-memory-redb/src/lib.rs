@@ -22,10 +22,7 @@ use langchart_adapters::memory::{
 };
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{path::Path, sync::Arc};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -46,7 +43,7 @@ struct StoredRecord {
 /// A [`MemoryAdapter`] backed by an embedded redb database.
 #[derive(Clone)]
 pub struct RedbMemoryAdapter {
-    db: Arc<Mutex<Database>>,
+    db: Arc<Database>,
 }
 
 impl RedbMemoryAdapter {
@@ -62,9 +59,7 @@ impl RedbMemoryAdapter {
             .map_err(|e| StoreError::Open(e.to_string()))?;
         tx.commit().map_err(|e| StoreError::Open(e.to_string()))?;
 
-        Ok(Self {
-            db: Arc::new(Mutex::new(db)),
-        })
+        Ok(Self { db: Arc::new(db) })
     }
 
     fn scope_key(scope: &MemoryScope) -> String {
@@ -95,20 +90,26 @@ impl MemoryAdapter for RedbMemoryAdapter {
         };
         let value =
             serde_json::to_string(&stored).map_err(|e| MemoryError::Store(e.to_string()))?;
+        let db = self.db.clone();
+        let stored_id = id.0.clone();
 
-        let db = self.db.lock().unwrap();
-        let tx = db
-            .begin_write()
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        {
-            let mut table = tx
-                .open_table(MEMORY)
+        tokio::task::spawn_blocking(move || {
+            let tx = db
+                .begin_write()
                 .map_err(|e| MemoryError::Store(e.to_string()))?;
-            table
-                .insert(id.0.as_str(), value.as_str())
-                .map_err(|e| MemoryError::Store(e.to_string()))?;
-        }
-        tx.commit().map_err(|e| MemoryError::Store(e.to_string()))?;
+            {
+                let mut table = tx
+                    .open_table(MEMORY)
+                    .map_err(|e| MemoryError::Store(e.to_string()))?;
+                table
+                    .insert(stored_id.as_str(), value.as_str())
+                    .map_err(|e| MemoryError::Store(e.to_string()))?;
+            }
+            tx.commit().map_err(|e| MemoryError::Store(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))??;
 
         Ok(id)
     }
@@ -128,89 +129,106 @@ impl MemoryAdapter for RedbMemoryAdapter {
                 return self.search_by_key(&scope_prefix, key, query.limit).await;
             }
         };
+        let limit = query.limit;
+        let db = self.db.clone();
 
-        let db = self.db.lock().unwrap();
-        let tx = db
-            .begin_read()
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        let table = tx
-            .open_table(MEMORY)
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
+        tokio::task::spawn_blocking(move || {
+            let tx = db
+                .begin_read()
+                .map_err(|e| MemoryError::Store(e.to_string()))?;
+            let table = tx
+                .open_table(MEMORY)
+                .map_err(|e| MemoryError::Store(e.to_string()))?;
 
-        let mut results = Vec::new();
-        for entry in table
-            .iter()
-            .map_err(|e| MemoryError::Store(e.to_string()))?
-        {
-            let (_, value_guard) = entry.map_err(|e| MemoryError::Store(e.to_string()))?;
-            let stored: StoredRecord = match serde_json::from_str(value_guard.value()) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            // Filter by scope.
-            if Self::scope_key(&stored.record.scope) != scope_prefix {
-                continue;
-            }
-
-            // Filter by text (substring match on content).
-            if let Some(ref text) = search_text
-                && !stored.record.content.to_lowercase().contains(text.as_str())
+            let mut results = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|e| MemoryError::Store(e.to_string()))?
             {
-                continue;
+                let (_, value_guard) = entry.map_err(|e| MemoryError::Store(e.to_string()))?;
+                let stored: StoredRecord = match serde_json::from_str(value_guard.value()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                // Filter by scope.
+                if Self::scope_key(&stored.record.scope) != scope_prefix {
+                    continue;
+                }
+
+                // Filter by text (substring match on content).
+                if let Some(ref text) = search_text
+                    && !stored.record.content.to_lowercase().contains(text.as_str())
+                {
+                    continue;
+                }
+
+                results.push(MemoryResult {
+                    id: MemoryId(stored.id),
+                    record: stored.record,
+                    score: None,
+                });
+
+                if results.len() >= limit as usize {
+                    break;
+                }
             }
 
-            results.push(MemoryResult {
-                id: MemoryId(stored.id),
-                record: stored.record,
-                score: None,
-            });
-
-            if results.len() >= query.limit as usize {
-                break;
-            }
-        }
-
-        Ok(results)
+            Ok(results)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 
     async fn get(&self, id: &MemoryId) -> Result<Option<MemoryRecord>, MemoryError> {
-        let db = self.db.lock().unwrap();
-        let tx = db
-            .begin_read()
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        let table = tx
-            .open_table(MEMORY)
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
+        let db = self.db.clone();
+        let id = id.0.clone();
 
-        match table
-            .get(id.0.as_str())
-            .map_err(|e| MemoryError::Store(e.to_string()))?
-        {
-            Some(guard) => {
-                let stored: StoredRecord = serde_json::from_str(guard.value())
-                    .map_err(|e| MemoryError::Store(e.to_string()))?;
-                Ok(Some(stored.record))
+        tokio::task::spawn_blocking(move || {
+            let tx = db
+                .begin_read()
+                .map_err(|e| MemoryError::Store(e.to_string()))?;
+            let table = tx
+                .open_table(MEMORY)
+                .map_err(|e| MemoryError::Store(e.to_string()))?;
+
+            match table
+                .get(id.as_str())
+                .map_err(|e| MemoryError::Store(e.to_string()))?
+            {
+                Some(guard) => {
+                    let stored: StoredRecord = serde_json::from_str(guard.value())
+                        .map_err(|e| MemoryError::Store(e.to_string()))?;
+                    Ok(Some(stored.record))
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
-        }
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 
     async fn delete(&self, id: &MemoryId) -> Result<(), MemoryError> {
-        let db = self.db.lock().unwrap();
-        let tx = db
-            .begin_write()
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        {
-            let mut table = tx
-                .open_table(MEMORY)
+        let db = self.db.clone();
+        let id = id.0.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let tx = db
+                .begin_write()
                 .map_err(|e| MemoryError::Store(e.to_string()))?;
-            table
-                .remove(id.0.as_str())
-                .map_err(|e| MemoryError::Store(e.to_string()))?;
-        }
-        tx.commit().map_err(|e| MemoryError::Store(e.to_string()))?;
-        Ok(())
+            {
+                let mut table = tx
+                    .open_table(MEMORY)
+                    .map_err(|e| MemoryError::Store(e.to_string()))?;
+                table
+                    .remove(id.as_str())
+                    .map_err(|e| MemoryError::Store(e.to_string()))?;
+            }
+            tx.commit().map_err(|e| MemoryError::Store(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 }
 
@@ -221,39 +239,46 @@ impl RedbMemoryAdapter {
         key: &str,
         limit: u32,
     ) -> Result<Vec<MemoryResult>, MemoryError> {
-        let db = self.db.lock().unwrap();
-        let tx = db
-            .begin_read()
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
-        let table = tx
-            .open_table(MEMORY)
-            .map_err(|e| MemoryError::Store(e.to_string()))?;
+        let db = self.db.clone();
+        let scope_prefix = scope_prefix.to_owned();
+        let key = key.to_owned();
 
-        let mut results = Vec::new();
-        for entry in table
-            .iter()
-            .map_err(|e| MemoryError::Store(e.to_string()))?
-        {
-            let (_, value_guard) = entry.map_err(|e| MemoryError::Store(e.to_string()))?;
-            let stored: StoredRecord = match serde_json::from_str(value_guard.value()) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            if Self::scope_key(&stored.record.scope) != scope_prefix {
-                continue;
-            }
-            if stored.record.key.as_deref() == Some(key) {
-                results.push(MemoryResult {
-                    id: MemoryId(stored.id),
-                    record: stored.record,
-                    score: Some(1.0),
-                });
-                if results.len() >= limit as usize {
-                    break;
+        tokio::task::spawn_blocking(move || {
+            let tx = db
+                .begin_read()
+                .map_err(|e| MemoryError::Store(e.to_string()))?;
+            let table = tx
+                .open_table(MEMORY)
+                .map_err(|e| MemoryError::Store(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|e| MemoryError::Store(e.to_string()))?
+            {
+                let (_, value_guard) = entry.map_err(|e| MemoryError::Store(e.to_string()))?;
+                let stored: StoredRecord = match serde_json::from_str(value_guard.value()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if Self::scope_key(&stored.record.scope) != scope_prefix {
+                    continue;
+                }
+                if stored.record.key.as_deref() == Some(key.as_str()) {
+                    results.push(MemoryResult {
+                        id: MemoryId(stored.id),
+                        record: stored.record,
+                        score: Some(1.0),
+                    });
+                    if results.len() >= limit as usize {
+                        break;
+                    }
                 }
             }
-        }
-        Ok(results)
+            Ok(results)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 }
 

@@ -16,10 +16,7 @@ use async_trait::async_trait;
 use langchart_adapters::checkpoint::{CheckpointError, CheckpointStore, RunSnapshot};
 use langchart_model::id::{CheckpointId, RunId};
 use redb::{Database, TableDefinition};
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{path::Path, sync::Arc};
 use tracing::debug;
 
 // Table: run_id (str) → JSON-encoded RunSnapshot (str)
@@ -30,7 +27,7 @@ const CHECKPOINTS: TableDefinition<&str, &str> = TableDefinition::new("checkpoin
 /// A [`CheckpointStore`] backed by an embedded redb database.
 #[derive(Clone)]
 pub struct RedbCheckpointStore {
-    db: Arc<Mutex<Database>>,
+    db: Arc<Database>,
 }
 
 impl RedbCheckpointStore {
@@ -46,9 +43,7 @@ impl RedbCheckpointStore {
             .map_err(|e| StoreError::Open(e.to_string()))?;
         tx.commit().map_err(|e| StoreError::Open(e.to_string()))?;
 
-        Ok(Self {
-            db: Arc::new(Mutex::new(db)),
-        })
+        Ok(Self { db: Arc::new(db) })
     }
 }
 
@@ -64,50 +59,61 @@ pub enum StoreError {
 impl CheckpointStore for RedbCheckpointStore {
     async fn save(&self, snapshot: &RunSnapshot) -> Result<CheckpointId, CheckpointError> {
         let checkpoint_id = snapshot.checkpoint_id.clone();
+        let run_id = snapshot.run_id.clone();
         let key = snapshot.run_id.0.clone();
         let value =
             serde_json::to_string(snapshot).map_err(|e| CheckpointError::Store(e.to_string()))?;
+        let db = self.db.clone();
 
-        let db = self.db.lock().unwrap();
-        let tx = db
-            .begin_write()
-            .map_err(|e| CheckpointError::Store(e.to_string()))?;
-        {
-            let mut table = tx
-                .open_table(CHECKPOINTS)
+        tokio::task::spawn_blocking(move || {
+            let tx = db
+                .begin_write()
                 .map_err(|e| CheckpointError::Store(e.to_string()))?;
-            table
-                .insert(key.as_str(), value.as_str())
+            {
+                let mut table = tx
+                    .open_table(CHECKPOINTS)
+                    .map_err(|e| CheckpointError::Store(e.to_string()))?;
+                table
+                    .insert(key.as_str(), value.as_str())
+                    .map_err(|e| CheckpointError::Store(e.to_string()))?;
+            }
+            tx.commit()
                 .map_err(|e| CheckpointError::Store(e.to_string()))?;
-        }
-        tx.commit()
-            .map_err(|e| CheckpointError::Store(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| CheckpointError::Store(e.to_string()))??;
 
-        debug!(run = %snapshot.run_id, checkpoint = %checkpoint_id, "checkpoint saved");
+        debug!(run = %run_id, checkpoint = %checkpoint_id, "checkpoint saved");
         Ok(checkpoint_id)
     }
 
     async fn load(&self, run_id: &RunId) -> Result<Option<RunSnapshot>, CheckpointError> {
         let key = run_id.0.clone();
-        let db = self.db.lock().unwrap();
-        let tx = db
-            .begin_read()
-            .map_err(|e| CheckpointError::Store(e.to_string()))?;
-        let table = tx
-            .open_table(CHECKPOINTS)
-            .map_err(|e| CheckpointError::Store(e.to_string()))?;
+        let db = self.db.clone();
 
-        match table
-            .get(key.as_str())
-            .map_err(|e| CheckpointError::Store(e.to_string()))?
-        {
-            Some(guard) => {
-                let snapshot: RunSnapshot = serde_json::from_str(guard.value())
-                    .map_err(|e| CheckpointError::Store(e.to_string()))?;
-                Ok(Some(snapshot))
+        tokio::task::spawn_blocking(move || {
+            let tx = db
+                .begin_read()
+                .map_err(|e| CheckpointError::Store(e.to_string()))?;
+            let table = tx
+                .open_table(CHECKPOINTS)
+                .map_err(|e| CheckpointError::Store(e.to_string()))?;
+
+            match table
+                .get(key.as_str())
+                .map_err(|e| CheckpointError::Store(e.to_string()))?
+            {
+                Some(guard) => {
+                    let snapshot: RunSnapshot = serde_json::from_str(guard.value())
+                        .map_err(|e| CheckpointError::Store(e.to_string()))?;
+                    Ok(Some(snapshot))
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
-        }
+        })
+        .await
+        .map_err(|e| CheckpointError::Store(e.to_string()))?
     }
 
     async fn latest(&self, run_id: &RunId) -> Result<Option<CheckpointId>, CheckpointError> {
