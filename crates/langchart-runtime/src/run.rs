@@ -1987,6 +1987,7 @@ impl WorkflowInstance {
                         )
                         .await?;
                     } else {
+                        self.attempt_counts.remove(&state_id);
                         self.emit(RuntimeEventPayload::ActivityCompleted {
                             state_id: state_id.clone(),
                         })

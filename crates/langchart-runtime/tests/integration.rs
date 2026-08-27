@@ -1232,6 +1232,10 @@ async fn retry_succeeds_on_third_attempt() {
         RunStatus::Completed,
         "should complete after successful retry"
     );
+    assert!(
+        inst.take_checkpoint().attempt_counts.is_empty(),
+        "a successful activity must clear its retry attempt count"
+    );
 
     let payloads = sink.payloads().await;
 
