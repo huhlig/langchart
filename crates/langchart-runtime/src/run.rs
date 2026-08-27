@@ -1282,7 +1282,8 @@ impl WorkflowInstance {
         // Clean up completion tracking.
         self.parallel_regions_done.remove(parallel_id);
 
-        // Emit StateExited for the parallel state itself.
+        // Run lifecycle hooks and emit StateExited for the parallel state itself.
+        self.run_on_exit_actions(parallel_id).await?;
         self.emit(RuntimeEventPayload::StateExited {
             state_id: parallel_id.clone(),
         })
@@ -1346,6 +1347,7 @@ impl WorkflowInstance {
             self.timers.cancel(&tid);
         }
         self.active_states.retain(|s| s != state_id);
+        self.run_on_exit_actions(state_id).await?;
         self.emit(RuntimeEventPayload::StateExited {
             state_id: state_id.clone(),
         })

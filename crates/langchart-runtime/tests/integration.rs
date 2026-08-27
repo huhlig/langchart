@@ -764,6 +764,24 @@ async fn parallel_any_completion() {
         id::RegionId,
         state::{ParallelCompletion, ParallelRegion},
     };
+    use langchart_runtime::instance::{ActionContext, ActionError, ActionRegistry, StateAction};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct CountExit(Arc<AtomicU32>);
+
+    #[async_trait]
+    impl StateAction for CountExit {
+        async fn run(
+            &self,
+            _ctx: ActionContext,
+            _broker: Arc<CapabilityBroker>,
+        ) -> Result<(), ActionError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let exit_count = Arc::new(AtomicU32::new(0));
 
     let region_a = ParallelRegion {
         id: RegionId::new("region_a"),
@@ -776,7 +794,11 @@ async fn parallel_any_completion() {
                 "final_a2",
                 None,
             ),
-            leaf_state("final_a2", StateType::Final),
+            {
+                let mut state = leaf_state("final_a2", StateType::Final);
+                state.on_exit = vec!["count_exit".into()];
+                state
+            },
         ],
     };
 
@@ -786,7 +808,11 @@ async fn parallel_any_completion() {
         initial: StateId::new("task_b2"),
         states: vec![
             // task_b2 has NO transitions — would never complete on its own.
-            leaf_state("task_b2", StateType::Atomic),
+            {
+                let mut state = leaf_state("task_b2", StateType::Atomic);
+                state.on_exit = vec!["count_exit".into()];
+                state
+            },
             leaf_state("final_b2", StateType::Final),
         ],
     };
@@ -825,7 +851,7 @@ async fn parallel_any_completion() {
         ports: None,
         authorized_roles: vec![],
         on_entry: vec![],
-        on_exit: vec![],
+        on_exit: vec!["count_exit".into()],
         retry: None,
         timeout: None,
         output_schemas: Default::default(),
@@ -842,12 +868,16 @@ async fn parallel_any_completion() {
 
     let sink = Arc::new(VecSink::default());
     let broker = bare_broker(sink.clone());
-    let mut inst = WorkflowInstance::new(
+    let registry = ActionRegistry::new()
+        .register("count_exit", CountExit(exit_count.clone()))
+        .into_map();
+    let mut inst = WorkflowInstance::with_actions(
         RunId::new("r8"),
         compiled,
         broker,
         sink.clone(),
         HashMap::new(),
+        registry,
     );
 
     inst.start().await.expect("start");
@@ -860,6 +890,11 @@ async fn parallel_any_completion() {
         status,
         RunStatus::Completed,
         "parallel Any should complete after one region"
+    );
+    assert_eq!(
+        exit_count.load(Ordering::SeqCst),
+        3,
+        "both active region states and the parallel state must run on_exit"
     );
 }
 
