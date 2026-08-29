@@ -72,6 +72,7 @@ complete runtime wiring.
 | [`langchart-llm-generic`](crates/langchart-llm-generic)         | `LlmAdapter` for OpenAI, Anthropic, and any OpenAI-compatible endpoint               |
 | [`langchart-llm-genai`](crates/langchart-llm-genai)             | `LlmAdapter` backed by `genai` (Gemini, Groq, Cohere, xAI, DeepSeek)                 |
 | [`langchart-llm-watsonx`](crates/langchart-llm-watsonx)         | IBM watsonx.ai `LlmAdapter` with IAM authentication                                  |
+| [`langchart-llm-bedrock`](crates/langchart-llm-bedrock)         | AWS Bedrock Converse API `LlmAdapter`                                                |
 | [`langchart-mcp-client`](crates/langchart-mcp-client)           | `McpAdapter` over child-process MCP servers via `rmcp`                               |
 | [`langchart-artifact-fs`](crates/langchart-artifact-fs)         | File-system `ArtifactStore` with atomic writes and optimistic concurrency            |
 | [`langchart-checkpoint-redb`](crates/langchart-checkpoint-redb) | Embedded redb-backed `CheckpointStore`                                               |

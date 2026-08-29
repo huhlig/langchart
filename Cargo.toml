@@ -9,6 +9,7 @@ members = [
     "crates/langchart-context",
     "crates/langchart-docuvault",
     "crates/langchart-editor-tauri",
+    "crates/langchart-llm-bedrock",
     "crates/langchart-llm-genai",
     "crates/langchart-llm-generic",
     "crates/langchart-llm-watsonx",
@@ -30,6 +31,7 @@ default-members = [
     "crates/langchart-checkpoint-redb",
     "crates/langchart-cli",
     "crates/langchart-context",
+    "crates/langchart-llm-bedrock",
     "crates/langchart-llm-genai",
     "crates/langchart-llm-generic",
     "crates/langchart-llm-watsonx",
@@ -55,6 +57,7 @@ langchart-adapters = { path = "crates/langchart-adapters" }
 langchart-runtime = { path = "crates/langchart-runtime" }
 langchart-context = { path = "crates/langchart-context" }
 langchart-docuvault = { path = "crates/langchart-docuvault" }
+langchart-llm-bedrock = { path = "crates/langchart-llm-bedrock" }
 
 # Async
 tokio = { version = "1", features = ["full"] }

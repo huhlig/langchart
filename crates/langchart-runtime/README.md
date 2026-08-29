@@ -37,6 +37,7 @@ crates:
 - [`langchart-llm-generic`](../langchart-llm-generic) — OpenAI / Anthropic / compatible endpoints
 - [`langchart-llm-genai`](../langchart-llm-genai) — `genai`-backed multi-provider adapter
 - [`langchart-llm-watsonx`](../langchart-llm-watsonx) — IBM watsonx.ai
+- [`langchart-llm-bedrock`](../langchart-llm-bedrock) — AWS Bedrock Converse API
 - [`langchart-mcp-client`](../langchart-mcp-client) — child-process MCP servers
 - [`langchart-artifact-fs`](../langchart-artifact-fs) — file-system artifact store
 - [`langchart-checkpoint-redb`](../langchart-checkpoint-redb) — embedded redb checkpoint store

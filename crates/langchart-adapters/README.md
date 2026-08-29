@@ -31,6 +31,7 @@ Implement a trait in your host application, or use one of the concrete adapter c
 - [`langchart-llm-generic`](../langchart-llm-generic) — OpenAI, Anthropic, and compatible endpoints
 - [`langchart-llm-genai`](../langchart-llm-genai) — Gemini, Groq, Cohere, xAI, DeepSeek
 - [`langchart-llm-watsonx`](../langchart-llm-watsonx) — IBM watsonx.ai
+- [`langchart-llm-bedrock`](../langchart-llm-bedrock) — AWS Bedrock Converse API
 - [`langchart-mcp-client`](../langchart-mcp-client) — child-process MCP servers
 - [`langchart-artifact-fs`](../langchart-artifact-fs) — file-system artifact store
 - [`langchart-checkpoint-redb`](../langchart-checkpoint-redb) — embedded checkpoint store
