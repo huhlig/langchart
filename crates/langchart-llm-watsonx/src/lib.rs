@@ -356,7 +356,10 @@ struct IamTokenResponse {
 #[cfg(test)]
 #[derive(Deserialize)]
 struct WatsonxChatResponse {
-    model_id: String,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     model_version: Option<String>,
     choices: Vec<WatsonxChoice>,
     #[serde(default)]
@@ -371,10 +374,10 @@ impl WatsonxChatResponse {
             .into_iter()
             .next()
             .ok_or_else(|| LlmError::Provider("watsonx returned no choices".to_owned()))?;
-        let prompt_tokens = self.usage.prompt;
-        let completion_tokens = self.usage.completion;
-        let resolved_model = self.model_id.clone();
-        let reported_model = self.model_version.unwrap_or(self.model_id);
+        let prompt_tokens = self.usage.prompt();
+        let completion_tokens = self.usage.completion();
+        let resolved_model = self.model_id.or(self.model).unwrap_or_default();
+        let reported_model = self.model_version.unwrap_or_else(|| resolved_model.clone());
         Ok(LlmResponse {
             content: Some(choice.message.content),
             tool_calls: Vec::new(),
@@ -383,7 +386,7 @@ impl WatsonxChatResponse {
                 completion_tokens,
                 total_tokens: self
                     .usage
-                    .total
+                    .total()
                     .unwrap_or(prompt_tokens.saturating_add(completion_tokens)),
             },
             finish_reason: map_finish_reason(choice.finish_reason.as_deref()),
@@ -406,14 +409,33 @@ struct WatsonxResponseMessage {
     content: String,
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Default, Deserialize)]
 struct WatsonxUsage {
-    #[serde(default, rename = "prompt_tokens", alias = "input_tokens")]
-    prompt: u32,
-    #[serde(default, rename = "completion_tokens", alias = "generated_tokens")]
-    completion: u32,
-    #[serde(rename = "total_tokens")]
-    total: Option<u32>,
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    generated_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+}
+
+impl WatsonxUsage {
+    fn prompt(&self) -> u32 {
+        self.prompt_tokens.or(self.input_tokens).unwrap_or(0)
+    }
+
+    fn completion(&self) -> u32 {
+        self.completion_tokens.or(self.generated_tokens).unwrap_or(0)
+    }
+
+    fn total(&self) -> Option<u32> {
+        self.total_tokens
+    }
 }
 
 fn map_finish_reason(reason: Option<&str>) -> FinishReason {
@@ -427,11 +449,19 @@ fn map_finish_reason(reason: Option<&str>) -> FinishReason {
 
 #[derive(Deserialize)]
 struct WatsonxStreamChunk {
-    #[serde(default, alias = "model")]
+    #[serde(default)]
     model_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     choices: Vec<WatsonxStreamChoice>,
     usage: Option<WatsonxUsage>,
+}
+
+impl WatsonxStreamChunk {
+    fn model(&self) -> Option<&str> {
+        self.model_id.as_deref().or(self.model.as_deref())
+    }
 }
 
 #[derive(Deserialize)]
@@ -615,17 +645,17 @@ where
         }
 
         fn apply(&mut self, chunk: WatsonxStreamChunk) {
-            if let Some(reported_model) = chunk.model_id {
-                self.reported_model = Some(reported_model);
+            if let Some(reported_model) = chunk.model() {
+                self.reported_model = Some(reported_model.to_owned());
             }
             self.start();
             if let Some(usage) = chunk.usage {
                 self.usage = TokenUsage {
-                    prompt_tokens: usage.prompt,
-                    completion_tokens: usage.completion,
+                    prompt_tokens: usage.prompt(),
+                    completion_tokens: usage.completion(),
                     total_tokens: usage
-                        .total
-                        .unwrap_or_else(|| usage.prompt.saturating_add(usage.completion)),
+                        .total()
+                        .unwrap_or_else(|| usage.prompt().saturating_add(usage.completion())),
                 };
                 self.queue.push_back(Ok(LlmStreamEvent::UsageUpdate {
                     usage: self.usage.clone(),
@@ -679,6 +709,13 @@ where
             match state.stream.next().await {
                 None => {
                     state.done = true;
+                    if state.started {
+                        state.finalize();
+                        if let Some(event) = state.queue.pop_front() {
+                            return Some((event, state));
+                        }
+                        return None;
+                    }
                     return Some((
                         Err(LlmError::IncompleteStream {
                             received_bytes: state.received_bytes,
@@ -1061,4 +1098,33 @@ mod tests {
         server.await.unwrap();
         assert_eq!(bytes, expected);
     }
+
+    #[tokio::test]
+    async fn stream_handles_duplicate_model_keys_and_eof_without_done() {
+        let body = "data: {\"model_id\":\"meta-llama/llama-3-3-70b-instruct\",\"model\":\"meta-llama/llama-3-3-70b-instruct\",\"choices\":[{\"delta\":{\"content\":\"WatsonX works!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"input_tokens\":10,\"generated_tokens\":5,\"total_tokens\":15}}\n\n";
+        let source = stream::iter([Ok::<bytes::Bytes, LlmError>(bytes::Bytes::from_static(
+            body.as_bytes(),
+        ))]);
+        let mut events = watsonx_event_stream(
+            source.eventsource(),
+            "meta-llama/llama-3-3-70b-instruct".to_owned(),
+            Some("req-2".to_owned()),
+        );
+        let mut completed = None;
+        while let Some(event) = events.next().await {
+            if let LlmStreamEvent::ResponseCompleted { response } = event.unwrap() {
+                completed = Some(response);
+            }
+        }
+        let response = completed.expect("stream EOF must complete the response");
+        assert_eq!(response.content.as_deref(), Some("WatsonX works!"));
+        assert_eq!(response.usage.prompt_tokens, 10);
+        assert_eq!(response.usage.completion_tokens, 5);
+        assert_eq!(response.usage.total_tokens, 15);
+        assert_eq!(
+            response.reported_model.as_deref(),
+            Some("meta-llama/llama-3-3-70b-instruct")
+        );
+    }
 }
+
