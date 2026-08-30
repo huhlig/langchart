@@ -23,9 +23,11 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "sso", "credentials-process", "credentials-login"] }
 aws-credential-types = "1"
 aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+aws-smithy-types = "1"
 langchart-adapters.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 

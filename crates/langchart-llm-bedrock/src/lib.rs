@@ -26,11 +26,41 @@ use aws_sdk_bedrockruntime::{
         Message as BedrockMessage, StopReason, SystemContentBlock,
     },
 };
+use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
+use aws_smithy_runtime_api::client::interceptors::Intercept;
+use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+use aws_smithy_types::config_bag::ConfigBag;
 use langchart_adapters::llm::{
     FinishReason, LlmAdapter, LlmError, LlmRequest, LlmResponse, Message, ModelInfo, ResponseFormat,
     TokenUsage,
 };
 use tokio::sync::OnceCell;
+
+#[derive(Debug)]
+struct BearerTokenInterceptor {
+    token: String,
+}
+
+impl Intercept for BearerTokenInterceptor {
+    fn name(&self) -> &'static str {
+        "BedrockBearerTokenInterceptor"
+    }
+
+    fn modify_before_transmit(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let headers = context.request_mut().headers_mut();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", self.token.trim()),
+        );
+        Ok(())
+    }
+}
 
 /// Configuration for the Bedrock client and endpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,7 +94,9 @@ pub enum BedrockCredentials {
         secret_access_key: String,
         session_token: Option<String>,
     },
-    /// Rely on the default AWS credential provider chain (environment variables, SSO, IAM roles, profiles).
+    /// Bearer token / API key (e.g. `AWS_BEARER_TOKEN_BEDROCK`) for Bedrock endpoint.
+    BearerToken(String),
+    /// Rely on the default AWS credential provider chain (environment variables, SSO, IAM roles, profiles, or `AWS_BEARER_TOKEN_BEDROCK`).
     EnvironmentOrProfile,
 }
 
@@ -102,24 +134,51 @@ impl BedrockAdapter {
                     config_loader = config_loader.profile_name(profile);
                 }
 
-                if let BedrockCredentials::Static {
-                    access_key_id,
-                    secret_access_key,
-                    session_token,
-                } = &self.credentials
-                {
+                let bearer_token = match &self.credentials {
+                    BedrockCredentials::BearerToken(token) => Some(token.clone()),
+                    BedrockCredentials::EnvironmentOrProfile => {
+                        std::env::var("AWS_BEARER_TOKEN_BEDROCK")
+                            .ok()
+                            .or_else(|| std::env::var("AWS_BEARER_TOKEN").ok())
+                            .or_else(|| std::env::var("BEDROCK_API_KEY").ok())
+                            .filter(|t| !t.trim().is_empty())
+                    }
+                    BedrockCredentials::Static {
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                    } => {
+                        let creds = aws_credential_types::Credentials::new(
+                            access_key_id.clone(),
+                            secret_access_key.clone(),
+                            session_token.clone(),
+                            None,
+                            "langchart-bedrock-static",
+                        );
+                        config_loader = config_loader.credentials_provider(creds);
+                        None
+                    }
+                };
+
+                if let Some(token) = bearer_token {
+                    // Provide dummy credentials so config loading doesn't fail on missing AWS IAM credentials
                     let creds = aws_credential_types::Credentials::new(
-                        access_key_id.clone(),
-                        secret_access_key.clone(),
-                        session_token.clone(),
+                        "bearer",
+                        "bearer",
                         None,
-                        "langchart-bedrock-static",
+                        None,
+                        "langchart-bedrock-bearer",
                     );
                     config_loader = config_loader.credentials_provider(creds);
+                    let sdk_config = config_loader.load().await;
+                    let bedrock_config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
+                        .interceptor(BearerTokenInterceptor { token })
+                        .build();
+                    BedrockClient::from_conf(bedrock_config)
+                } else {
+                    let sdk_config = config_loader.load().await;
+                    BedrockClient::new(&sdk_config)
                 }
-
-                let sdk_config = config_loader.load().await;
-                BedrockClient::new(&sdk_config)
             })
             .await
     }
@@ -333,6 +392,24 @@ mod tests {
             session_token: Some("token123".to_owned()),
         };
         assert!(matches!(creds, BedrockCredentials::Static { .. }));
+
+        let bearer = BedrockCredentials::BearerToken("secret-bearer-token".to_owned());
+        assert_eq!(
+            bearer,
+            BedrockCredentials::BearerToken("secret-bearer-token".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bedrock_adapter_bearer_token_client_init() {
+        let adapter = BedrockAdapter::new(
+            BedrockConfig::new("us-east-1"),
+            BedrockCredentials::BearerToken("test-token-12345".to_owned()),
+        )
+        .unwrap();
+
+        // Ensure client initialization with BearerToken succeeds
+        let _client = adapter.client().await;
     }
 
     #[tokio::test]
