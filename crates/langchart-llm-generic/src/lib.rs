@@ -284,6 +284,7 @@ impl GenericLlmAdapter {
                         attempt = attempt + 1,
                         max = self.max_retries,
                         delay_ms = wait.as_millis(),
+                        error = %e,
                         "retrying after transient error"
                     );
                     if !wait.is_zero() {
