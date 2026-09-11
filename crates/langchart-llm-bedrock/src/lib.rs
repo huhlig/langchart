@@ -18,6 +18,8 @@
 //! requests to AWS Bedrock foundation models using the uniform Bedrock Converse API.
 
 use async_trait::async_trait;
+#[cfg(feature = "control-plane")]
+use aws_sdk_bedrock::Client as BedrockControlPlaneClient;
 use aws_sdk_bedrockruntime::{
     Client as BedrockClient,
     operation::converse::ConverseError,
@@ -35,6 +37,7 @@ use langchart_adapters::llm::{
     FinishReason, LlmAdapter, LlmError, LlmRequest, LlmResponse, Message, ModelInfo, ResponseFormat,
     TokenUsage,
 };
+use std::collections::HashSet;
 use tokio::sync::OnceCell;
 
 #[derive(Debug)]
@@ -71,8 +74,13 @@ pub struct BedrockConfig {
     pub endpoint_url: Option<String>,
     /// Optional AWS named profile in `~/.aws/credentials`.
     pub profile_name: Option<String>,
-    /// Optional AWS Bedrock inference profile ID or ARN (e.g. `us.anthropic.claude-3-7-sonnet-20250219-v1:0`).
+    /// Optional default AWS Bedrock inference profile ID or ARN (e.g. `us.anthropic.claude-3-7-sonnet-20250219-v1:0`).
+    ///
+    /// Note: An inference profile is a model identifier and can also be passed
+    /// directly as `request.model_policy.model` or registered via [`Self::with_model`].
     pub inference_profile: Option<String>,
+    /// Optional list of recognized model IDs or inference profile IDs.
+    pub models: Vec<String>,
 }
 
 impl BedrockConfig {
@@ -84,7 +92,26 @@ impl BedrockConfig {
             endpoint_url: None,
             profile_name: None,
             inference_profile: None,
+            models: Vec::new(),
         }
+    }
+
+    /// Adds a model ID or inference profile ID to the list of recognized models.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.models.push(model.into());
+        self
+    }
+
+    /// Adds multiple model IDs or inference profile IDs to the list of recognized models.
+    #[must_use]
+    pub fn with_models<I, S>(mut self, models: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.models.extend(models.into_iter().map(Into::into));
+        self
     }
 
     /// Sets the Bedrock inference profile ID or ARN.
@@ -124,11 +151,30 @@ pub enum BedrockCredentials {
     EnvironmentOrProfile,
 }
 
+/// Determines if the provided model identifier is an AWS Bedrock inference profile ID or ARN.
+///
+/// Recognized patterns:
+/// - System-defined regional inference profiles (`us.*`, `eu.*`, `apac.*`, `cr.*`)
+/// - System-defined global inference profiles (`global.*`)
+/// - Application inference profile ARNs (`arn:aws:bedrock:...` or general `arn:aws:`)
+#[must_use]
+pub fn is_inference_profile(model_or_profile: &str) -> bool {
+    let trimmed = model_or_profile.trim();
+    trimmed.starts_with("us.")
+        || trimmed.starts_with("eu.")
+        || trimmed.starts_with("apac.")
+        || trimmed.starts_with("cr.")
+        || trimmed.starts_with("global.")
+        || trimmed.starts_with("arn:aws:")
+}
+
 /// Bedrock LLM Adapter implementing [`LlmAdapter`].
 pub struct BedrockAdapter {
     config: BedrockConfig,
     credentials: BedrockCredentials,
     client: OnceCell<BedrockClient>,
+    #[cfg(feature = "control-plane")]
+    control_plane_client: OnceCell<Option<BedrockControlPlaneClient>>,
 }
 
 impl BedrockAdapter {
@@ -141,6 +187,8 @@ impl BedrockAdapter {
             config,
             credentials,
             client: OnceCell::new(),
+            #[cfg(feature = "control-plane")]
+            control_plane_client: OnceCell::new(),
         })
     }
 
@@ -207,6 +255,95 @@ impl BedrockAdapter {
             .await
     }
 
+    /// Obtains or initializes the underlying AWS Bedrock Control Plane client when available.
+    #[cfg(feature = "control-plane")]
+    async fn control_plane_client(&self) -> Option<&BedrockControlPlaneClient> {
+        self.control_plane_client
+            .get_or_init(|| async {
+                match &self.credentials {
+                    BedrockCredentials::BearerToken(_) => None,
+                    BedrockCredentials::Static {
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                    } => {
+                        let creds = aws_credential_types::Credentials::new(
+                            access_key_id.clone(),
+                            secret_access_key.clone(),
+                            session_token.clone(),
+                            None,
+                            "langchart-bedrock-static",
+                        );
+                        let mut config_loader =
+                            aws_config::defaults(aws_config::BehaviorVersion::latest())
+                                .region(aws_config::Region::new(self.config.region.clone()))
+                                .credentials_provider(creds);
+                        if let Some(endpoint) = &self.config.endpoint_url {
+                            config_loader = config_loader.endpoint_url(endpoint);
+                        }
+                        let sdk_config = config_loader.load().await;
+                        Some(BedrockControlPlaneClient::new(&sdk_config))
+                    }
+                    BedrockCredentials::EnvironmentOrProfile => {
+                        let has_bearer = std::env::var("AWS_BEARER_TOKEN_BEDROCK")
+                            .ok()
+                            .or_else(|| std::env::var("AWS_BEARER_TOKEN").ok())
+                            .or_else(|| std::env::var("BEDROCK_API_KEY").ok())
+                            .filter(|t| !t.trim().is_empty())
+                            .is_some();
+                        if has_bearer {
+                            return None;
+                        }
+
+                        let mut config_loader =
+                            aws_config::defaults(aws_config::BehaviorVersion::latest())
+                                .region(aws_config::Region::new(self.config.region.clone()));
+                        if let Some(endpoint) = &self.config.endpoint_url {
+                            config_loader = config_loader.endpoint_url(endpoint);
+                        }
+                        if let Some(profile) = &self.config.profile_name {
+                            config_loader = config_loader.profile_name(profile);
+                        }
+                        let sdk_config = config_loader.load().await;
+                        Some(BedrockControlPlaneClient::new(&sdk_config))
+                    }
+                }
+            })
+            .await
+            .as_ref()
+    }
+
+    /// Fetches models and inference profiles from the Bedrock Control Plane.
+    #[cfg(feature = "control-plane")]
+    async fn fetch_control_plane_models(
+        &self,
+        client: &BedrockControlPlaneClient,
+    ) -> Result<Vec<ModelInfo>, LlmError> {
+        let mut models = Vec::new();
+
+        if let Ok(resp) = client.list_inference_profiles().send().await {
+            for summary in resp.inference_profile_summaries() {
+                models.push(ModelInfo {
+                    id: summary.inference_profile_id().to_owned(),
+                    description: summary.description().map(str::to_owned).or_else(|| {
+                        Some(format!("{} (Inference Profile)", summary.inference_profile_name()))
+                    }),
+                });
+            }
+        }
+
+        if let Ok(resp) = client.list_foundation_models().send().await {
+            for summary in resp.model_summaries() {
+                models.push(ModelInfo {
+                    id: summary.model_id().to_owned(),
+                    description: summary.model_name().map(str::to_owned),
+                });
+            }
+        }
+
+        Ok(models)
+    }
+
     /// Returns the Bedrock configuration.
     #[must_use]
     pub fn config(&self) -> &BedrockConfig {
@@ -229,32 +366,18 @@ impl BedrockAdapter {
             }
         }
 
-        // 2. Explicit inference_profile in BedrockConfig
-        if let Some(profile) = &self.config.inference_profile {
-            let trimmed = profile.trim();
-            if !trimmed.is_empty() {
+        // 2. If primary model is already an inference profile or ARN, return it directly
+        if let Some(model) = primary_model {
+            let trimmed = model.trim();
+            if is_inference_profile(trimmed) {
                 return Some(trimmed.to_owned());
             }
         }
 
-        // 3. Environment variables
-        if let Some(profile) = std::env::var("AWS_BEDROCK_INFERENCE_PROFILE_ID")
-            .ok()
-            .or_else(|| std::env::var("AWS_BEDROCK_INFERENCE_PROFILE").ok())
-            .or_else(|| std::env::var("BEDROCK_INFERENCE_PROFILE").ok())
-            .filter(|s| !s.trim().is_empty())
-        {
-            return Some(profile.trim().to_owned());
-        }
-
-        // 4. Regional system inference profile fallback for known foundation models
+        // 3. Regional system inference profile fallback for bare foundation models
         if let Some(model) = primary_model {
-            if !model.starts_with("us.")
-                && !model.starts_with("eu.")
-                && !model.starts_with("apac.")
-                && !model.starts_with("cr.")
-                && !model.starts_with("arn:aws:")
-            {
+            let trimmed = model.trim();
+            if !is_inference_profile(trimmed) {
                 let prefix = if self.config.region.starts_with("us-") {
                     Some("us.")
                 } else if self.config.region.starts_with("eu-") {
@@ -266,9 +389,27 @@ impl BedrockAdapter {
                 };
 
                 if let Some(p) = prefix {
-                    return Some(format!("{p}{model}"));
+                    return Some(format!("{p}{trimmed}"));
                 }
             }
+        }
+
+        // 4. Explicit inference_profile in BedrockConfig (when no primary model was specified or as fallback)
+        if let Some(profile) = &self.config.inference_profile {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+
+        // 5. Environment variables
+        if let Some(profile) = std::env::var("AWS_BEDROCK_INFERENCE_PROFILE_ID")
+            .ok()
+            .or_else(|| std::env::var("AWS_BEDROCK_INFERENCE_PROFILE").ok())
+            .or_else(|| std::env::var("BEDROCK_INFERENCE_PROFILE").ok())
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(profile.trim().to_owned());
         }
 
         None
@@ -338,18 +479,27 @@ impl LlmAdapter for BedrockAdapter {
         }
 
         let primary_model_id = request.model_policy.model.clone();
-        let inference_profile_id =
-            self.resolve_inference_profile(&request, primary_model_id.as_deref());
+        let explicit_profile = request
+            .model_policy
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && *p != "default");
 
-        let target_model_id = match (&primary_model_id, &inference_profile_id) {
-            (Some(model), _) => model.clone(),
-            (None, Some(profile)) => profile.clone(),
-            (None, None) => {
-                return Err(LlmError::Provider(
-                    "model ID or inference profile must be specified for Bedrock request".to_owned(),
-                ));
-            }
+        let target_model_id = if let Some(prof) = explicit_profile {
+            prof.to_owned()
+        } else if let Some(ref model) = primary_model_id {
+            model.clone()
+        } else if let Some(ref profile) = self.config.inference_profile {
+            profile.clone()
+        } else {
+            return Err(LlmError::Provider(
+                "model ID or inference profile must be specified for Bedrock request".to_owned(),
+            ));
         };
+
+        let fallback_profile_id =
+            self.resolve_inference_profile(&request, primary_model_id.as_deref());
 
         let mut system_blocks = Vec::new();
         let mut messages = Vec::new();
@@ -428,7 +578,7 @@ impl LlmAdapter for BedrockAdapter {
             Err(err) => {
                 let service_err = err.into_service_error();
                 if is_model_denied_or_inference_profile_required(&service_err) {
-                    if let Some(ref fallback_profile) = inference_profile_id {
+                    if let Some(ref fallback_profile) = fallback_profile_id {
                         if fallback_profile != &target_model_id {
                             match send_converse(fallback_profile).send().await {
                                 Ok(res) => (res, Some(fallback_profile.clone())),
@@ -502,44 +652,38 @@ impl LlmAdapter for BedrockAdapter {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         let mut models = Vec::new();
+        let mut seen_ids = HashSet::new();
 
-        if let Some(ref ip) = self.config.inference_profile {
-            models.push(ModelInfo {
-                id: ip.clone(),
-                description: Some("Configured AWS Bedrock Inference Profile".to_owned()),
-            });
-        }
-
-        let region_prefix = if self.config.region.starts_with("us-") {
-            Some("us.")
-        } else if self.config.region.starts_with("eu-") {
-            Some("eu.")
-        } else if self.config.region.starts_with("ap-") {
-            Some("apac.")
-        } else {
-            None
-        };
-
-        let base_models = [
-            ("anthropic.claude-3-7-sonnet-20250219-v1:0", "Anthropic Claude 3.7 Sonnet on Bedrock"),
-            ("anthropic.claude-3-5-sonnet-20241022-v2:0", "Anthropic Claude 3.5 Sonnet v2 on Bedrock"),
-            ("anthropic.claude-3-haiku-20240307-v1:0", "Anthropic Claude 3 Haiku on Bedrock"),
-            ("amazon.nova-pro-v1:0", "Amazon Nova Pro on Bedrock"),
-            ("amazon.nova-lite-v1:0", "Amazon Nova Lite on Bedrock"),
-            ("meta.llama3-3-70b-instruct-v1:0", "Meta Llama 3.3 70B Instruct on Bedrock"),
-        ];
-
-        for (id, desc) in base_models {
-            if let Some(prefix) = region_prefix {
+        // 1. Any explicitly configured models on BedrockConfig
+        for model_id in &self.config.models {
+            if seen_ids.insert(model_id.clone()) {
                 models.push(ModelInfo {
-                    id: format!("{prefix}{id}"),
-                    description: Some(format!("{desc} (Inference Profile)")),
+                    id: model_id.clone(),
+                    description: Some("Configured Bedrock Model".to_owned()),
                 });
             }
-            models.push(ModelInfo {
-                id: id.to_owned(),
-                description: Some(desc.to_owned()),
-            });
+        }
+
+        // 2. Any explicit inference profile on BedrockConfig
+        if let Some(ref ip) = self.config.inference_profile {
+            if seen_ids.insert(ip.clone()) {
+                models.push(ModelInfo {
+                    id: ip.clone(),
+                    description: Some("Configured AWS Bedrock Inference Profile".to_owned()),
+                });
+            }
+        }
+
+        // 3. If control-plane discovery feature is enabled, query Bedrock Control Plane dynamically
+        #[cfg(feature = "control-plane")]
+        if let Some(cp_client) = self.control_plane_client().await {
+            if let Ok(cp_models) = self.fetch_control_plane_models(cp_client).await {
+                for m in cp_models {
+                    if seen_ids.insert(m.id.clone()) {
+                        models.push(m);
+                    }
+                }
+            }
         }
 
         Ok(models)
@@ -555,7 +699,9 @@ mod tests {
         let config = BedrockConfig::new("us-west-2")
             .with_inference_profile("us.anthropic.claude-3-7-sonnet-20250219-v1:0")
             .with_endpoint_url("https://custom.bedrock.endpoint")
-            .with_profile_name("custom-profile");
+            .with_profile_name("custom-profile")
+            .with_model("custom.model-v1")
+            .with_models(["custom.model-v2", "custom.model-v3"]);
         assert_eq!(config.region, "us-west-2");
         assert_eq!(config.endpoint_url.as_deref(), Some("https://custom.bedrock.endpoint"));
         assert_eq!(config.profile_name.as_deref(), Some("custom-profile"));
@@ -563,6 +709,23 @@ mod tests {
             config.inference_profile.as_deref(),
             Some("us.anthropic.claude-3-7-sonnet-20250219-v1:0")
         );
+        assert_eq!(
+            config.models,
+            vec!["custom.model-v1", "custom.model-v2", "custom.model-v3"]
+        );
+    }
+
+    #[test]
+    fn test_bedrock_is_inference_profile() {
+        assert!(is_inference_profile("us.anthropic.claude-3-7-sonnet-20250219-v1:0"));
+        assert!(is_inference_profile("eu.anthropic.claude-3-5-sonnet-20240620-v1:0"));
+        assert!(is_inference_profile("apac.anthropic.claude-3-5-sonnet-20241022-v2:0"));
+        assert!(is_inference_profile("cr.anthropic.claude-3-5-sonnet-20241022-v2:0"));
+        assert!(is_inference_profile("global.anthropic.claude-3-7-sonnet-20250219-v1:0"));
+        assert!(is_inference_profile("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/my-profile"));
+        assert!(!is_inference_profile("anthropic.claude-3-7-sonnet-20250219-v1:0"));
+        assert!(!is_inference_profile("amazon.nova-pro-v1:0"));
+        assert!(!is_inference_profile("meta.llama3-3-70b-instruct-v1:0"));
     }
 
     #[test]
@@ -583,17 +746,72 @@ mod tests {
         let resolved = adapter.resolve_inference_profile(&request, Some("anthropic.claude-3-5-sonnet"));
         assert_eq!(resolved.as_deref(), Some("request-profile"));
 
-        // 2. When request profile is "default" or empty, fallback to config
-        request.model_policy.profile = Some("default".to_owned());
-        let resolved = adapter.resolve_inference_profile(&request, Some("anthropic.claude-3-5-sonnet"));
-        assert_eq!(resolved.as_deref(), Some("config-profile"));
-
-        // 3. Regional fallback when config is None
-        let config2 = BedrockConfig::new("us-east-1");
-        let adapter2 = BedrockAdapter::new(config2, BedrockCredentials::EnvironmentOrProfile).unwrap();
+        // 2. Global inference profile should NOT be prefixed with us.
         request.model_policy.profile = None;
-        let resolved2 = adapter2.resolve_inference_profile(&request, Some("anthropic.claude-3-5-sonnet-20241022-v2:0"));
-        assert_eq!(resolved2.as_deref(), Some("us.anthropic.claude-3-5-sonnet-20241022-v2:0"));
+        let resolved_global = adapter.resolve_inference_profile(
+            &request,
+            Some("global.anthropic.claude-3-7-sonnet-20250219-v1:0"),
+        );
+        assert_eq!(
+            resolved_global.as_deref(),
+            Some("global.anthropic.claude-3-7-sonnet-20250219-v1:0")
+        );
+
+        // 3. Application ARN inference profile should NOT be prefixed
+        let resolved_arn = adapter.resolve_inference_profile(
+            &request,
+            Some("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/custom-app"),
+        );
+        assert_eq!(
+            resolved_arn.as_deref(),
+            Some("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/custom-app")
+        );
+
+        // 4. Regional fallback for bare model without prefix
+        let resolved_bare = adapter.resolve_inference_profile(
+            &request,
+            Some("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+        );
+        assert_eq!(
+            resolved_bare.as_deref(),
+            Some("us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+        );
+
+        // 5. When no model is specified, fallback to config profile
+        let resolved_no_model = adapter.resolve_inference_profile(&request, None);
+        assert_eq!(resolved_no_model.as_deref(), Some("config-profile"));
+    }
+
+    #[test]
+    fn test_bedrock_multi_model_routing_independence() {
+        let config = BedrockConfig::new("us-east-1")
+            .with_inference_profile("us.anthropic.claude-3-5-sonnet-20241022-v2:0");
+        let adapter = BedrockAdapter::new(config, BedrockCredentials::EnvironmentOrProfile).unwrap();
+
+        let request = LlmRequest {
+            model_policy: Default::default(),
+            messages: vec![],
+            tools: vec![],
+            response_format: ResponseFormat::Text,
+        };
+
+        // Routing Nova Pro does NOT get hijacked by the config's Claude 3.5 profile
+        let nova = adapter.resolve_inference_profile(&request, Some("amazon.nova-pro-v1:0"));
+        assert_eq!(nova.as_deref(), Some("us.amazon.nova-pro-v1:0"));
+
+        // Routing Claude 3.7 global profile resolves cleanly
+        let global_claude = adapter.resolve_inference_profile(
+            &request,
+            Some("global.anthropic.claude-3-7-sonnet-20250219-v1:0"),
+        );
+        assert_eq!(
+            global_claude.as_deref(),
+            Some("global.anthropic.claude-3-7-sonnet-20250219-v1:0")
+        );
+
+        // Routing Llama 3.3 regional profile resolves cleanly
+        let llama = adapter.resolve_inference_profile(&request, Some("us.meta.llama3-3-70b-instruct-v1:0"));
+        assert_eq!(llama.as_deref(), Some("us.meta.llama3-3-70b-instruct-v1:0"));
     }
 
     #[test]
@@ -648,15 +866,28 @@ mod tests {
     #[tokio::test]
     async fn test_bedrock_adapter_list_models() {
         let adapter = BedrockAdapter::new(
-            BedrockConfig::new("us-east-1"),
+            BedrockConfig::new("us-east-1")
+                .with_model("custom.arbitrary-future-model")
+                .with_models(["global.anthropic.claude-5-sonnet", "us.anthropic.claude-5-sonnet"])
+                .with_inference_profile("us.custom-application-profile"),
             BedrockCredentials::EnvironmentOrProfile,
         )
         .unwrap();
 
         let models = adapter.list_models().await.unwrap();
         assert!(!models.is_empty());
-        assert!(models.iter().any(|m| m.id.contains("claude-3-7-sonnet")));
-        assert!(models.iter().any(|m| m.id.contains("amazon.nova-pro")));
+
+        // Configured custom models and profiles are recognized without any static gatekeeping
+        assert!(models.iter().any(|m| m.id == "custom.arbitrary-future-model"));
+        assert!(models.iter().any(|m| m.id == "global.anthropic.claude-5-sonnet"));
+        assert!(models.iter().any(|m| m.id == "us.anthropic.claude-5-sonnet"));
+        assert!(models.iter().any(|m| m.id == "us.custom-application-profile"));
+
+        // Deduplication check: every model id in the list must be unique
+        let mut seen = HashSet::new();
+        for m in &models {
+            assert!(seen.insert(&m.id), "Duplicate model id found: {}", m.id);
+        }
     }
 
     #[tokio::test]
