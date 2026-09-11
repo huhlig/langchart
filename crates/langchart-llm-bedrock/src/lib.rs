@@ -71,6 +71,8 @@ pub struct BedrockConfig {
     pub endpoint_url: Option<String>,
     /// Optional AWS named profile in `~/.aws/credentials`.
     pub profile_name: Option<String>,
+    /// Optional AWS Bedrock inference profile ID or ARN (e.g. `us.anthropic.claude-3-7-sonnet-20250219-v1:0`).
+    pub inference_profile: Option<String>,
 }
 
 impl BedrockConfig {
@@ -81,7 +83,29 @@ impl BedrockConfig {
             region: region.into(),
             endpoint_url: None,
             profile_name: None,
+            inference_profile: None,
         }
+    }
+
+    /// Sets the Bedrock inference profile ID or ARN.
+    #[must_use]
+    pub fn with_inference_profile(mut self, profile: impl Into<String>) -> Self {
+        self.inference_profile = Some(profile.into());
+        self
+    }
+
+    /// Sets an optional custom endpoint URL.
+    #[must_use]
+    pub fn with_endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
+        self.endpoint_url = Some(endpoint_url.into());
+        self
+    }
+
+    /// Sets an optional AWS named profile.
+    #[must_use]
+    pub fn with_profile_name(mut self, profile_name: impl Into<String>) -> Self {
+        self.profile_name = Some(profile_name.into());
+        self
     }
 }
 
@@ -188,6 +212,114 @@ impl BedrockAdapter {
     pub fn config(&self) -> &BedrockConfig {
         &self.config
     }
+
+    /// Resolves an inference profile ID if available from the request, configuration,
+    /// environment, or regional fallback for known foundation models.
+    #[must_use]
+    pub fn resolve_inference_profile(
+        &self,
+        request: &LlmRequest,
+        primary_model: Option<&str>,
+    ) -> Option<String> {
+        // 1. Explicit profile in model policy (if not empty or the placeholder "default")
+        if let Some(profile) = &request.model_policy.profile {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() && trimmed != "default" {
+                return Some(trimmed.to_owned());
+            }
+        }
+
+        // 2. Explicit inference_profile in BedrockConfig
+        if let Some(profile) = &self.config.inference_profile {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+
+        // 3. Environment variables
+        if let Some(profile) = std::env::var("AWS_BEDROCK_INFERENCE_PROFILE_ID")
+            .ok()
+            .or_else(|| std::env::var("AWS_BEDROCK_INFERENCE_PROFILE").ok())
+            .or_else(|| std::env::var("BEDROCK_INFERENCE_PROFILE").ok())
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(profile.trim().to_owned());
+        }
+
+        // 4. Regional system inference profile fallback for known foundation models
+        if let Some(model) = primary_model {
+            if !model.starts_with("us.")
+                && !model.starts_with("eu.")
+                && !model.starts_with("apac.")
+                && !model.starts_with("cr.")
+                && !model.starts_with("arn:aws:")
+            {
+                let prefix = if self.config.region.starts_with("us-") {
+                    Some("us.")
+                } else if self.config.region.starts_with("eu-") {
+                    Some("eu.")
+                } else if self.config.region.starts_with("ap-") {
+                    Some("apac.")
+                } else {
+                    None
+                };
+
+                if let Some(p) = prefix {
+                    return Some(format!("{p}{model}"));
+                }
+            }
+        }
+
+        None
+    }
+}
+
+fn map_converse_error(err: ConverseError, model_id: &str) -> LlmError {
+    match err {
+        ConverseError::ThrottlingException(e) => {
+            LlmError::RateLimited(e.message().unwrap_or("throttled by Bedrock").to_owned())
+        }
+        ConverseError::ModelNotReadyException(e) => LlmError::ModelNotFound {
+            model: e.message().unwrap_or(model_id).to_owned(),
+        },
+        ConverseError::ResourceNotFoundException(e) => LlmError::ModelNotFound {
+            model: e.message().unwrap_or(model_id).to_owned(),
+        },
+        ConverseError::AccessDeniedException(e) => {
+            let msg = e.message().unwrap_or("access denied to Bedrock model");
+            LlmError::Provider(format!("Bedrock access denied for `{model_id}`: {msg}"))
+        }
+        ConverseError::ValidationException(e) => {
+            let msg = e.message().unwrap_or("validation error");
+            if msg.contains("context length") || msg.contains("max tokens") {
+                LlmError::ContextLengthExceeded
+            } else {
+                LlmError::Provider(format!("Bedrock validation error: {msg}"))
+            }
+        }
+        other => LlmError::Provider(other.to_string()),
+    }
+}
+
+fn is_model_denied_or_inference_profile_required(err: &ConverseError) -> bool {
+    match err {
+        ConverseError::AccessDeniedException(_) => true,
+        ConverseError::ValidationException(e) => {
+            let msg = e.message().unwrap_or("").to_lowercase();
+            msg.contains("inference profile")
+                || msg.contains("on-demand throughput")
+                || msg.contains("not supported")
+                || msg.contains("denied")
+        }
+        ConverseError::ResourceNotFoundException(_) => true,
+        other => {
+            let msg = other.to_string().to_lowercase();
+            msg.contains("accessdenied")
+                || msg.contains("inference profile")
+                || msg.contains("denied")
+        }
+    }
 }
 
 #[async_trait]
@@ -205,11 +337,19 @@ impl LlmAdapter for BedrockAdapter {
             ));
         }
 
-        let model_id = request
-            .model_policy
-            .model
-            .clone()
-            .ok_or_else(|| LlmError::Provider("model ID must be specified for Bedrock request".to_owned()))?;
+        let primary_model_id = request.model_policy.model.clone();
+        let inference_profile_id =
+            self.resolve_inference_profile(&request, primary_model_id.as_deref());
+
+        let target_model_id = match (&primary_model_id, &inference_profile_id) {
+            (Some(model), _) => model.clone(),
+            (None, Some(profile)) => profile.clone(),
+            (None, None) => {
+                return Err(LlmError::Provider(
+                    "model ID or inference profile must be specified for Bedrock request".to_owned(),
+                ));
+            }
+        };
 
         let mut system_blocks = Vec::new();
         let mut messages = Vec::new();
@@ -262,38 +402,54 @@ impl LlmAdapter for BedrockAdapter {
         let inference_config = inference_builder.build();
 
         let client = self.client().await;
-        let mut converse_builder = client
-            .converse()
-            .model_id(&model_id)
-            .set_messages(Some(messages))
-            .inference_config(inference_config);
 
-        if !system_blocks.is_empty() {
-            converse_builder = converse_builder.set_system(Some(system_blocks));
-        }
+        let send_converse = |model_to_use: &str| {
+            let mut converse_builder = client
+                .converse()
+                .model_id(model_to_use)
+                .set_messages(Some(messages.clone()))
+                .inference_config(inference_config.clone());
 
-        let response = converse_builder.send().await.map_err(|err| {
-            match err.into_service_error() {
-                ConverseError::ThrottlingException(e) => {
-                    LlmError::RateLimited(e.message().unwrap_or("throttled by Bedrock").to_owned())
-                }
-                ConverseError::ModelNotReadyException(e) => LlmError::ModelNotFound {
-                    model: e.message().unwrap_or(&model_id).to_owned(),
-                },
-                ConverseError::ResourceNotFoundException(e) => LlmError::ModelNotFound {
-                    model: e.message().unwrap_or(&model_id).to_owned(),
-                },
-                ConverseError::ValidationException(e) => {
-                    let msg = e.message().unwrap_or("validation error");
-                    if msg.contains("context length") || msg.contains("max tokens") {
-                        LlmError::ContextLengthExceeded
-                    } else {
-                        LlmError::Provider(format!("Bedrock validation error: {msg}"))
-                    }
-                }
-                other => LlmError::Provider(other.to_string()),
+            if !system_blocks.is_empty() {
+                converse_builder = converse_builder.set_system(Some(system_blocks.clone()));
             }
-        })?;
+            converse_builder
+        };
+
+        let (response, reported_model) = match send_converse(&target_model_id).send().await {
+            Ok(res) => {
+                let reported = if primary_model_id.is_none() {
+                    Some(target_model_id.clone())
+                } else {
+                    None
+                };
+                (res, reported)
+            }
+            Err(err) => {
+                let service_err = err.into_service_error();
+                if is_model_denied_or_inference_profile_required(&service_err) {
+                    if let Some(ref fallback_profile) = inference_profile_id {
+                        if fallback_profile != &target_model_id {
+                            match send_converse(fallback_profile).send().await {
+                                Ok(res) => (res, Some(fallback_profile.clone())),
+                                Err(retry_err) => {
+                                    return Err(map_converse_error(
+                                        retry_err.into_service_error(),
+                                        fallback_profile,
+                                    ));
+                                }
+                            }
+                        } else {
+                            return Err(map_converse_error(service_err, &target_model_id));
+                        }
+                    } else {
+                        return Err(map_converse_error(service_err, &target_model_id));
+                    }
+                } else {
+                    return Err(map_converse_error(service_err, &target_model_id));
+                }
+            }
+        };
 
         let content = match response.output() {
             Some(ConverseOutput::Message(msg)) => {
@@ -331,44 +487,62 @@ impl LlmAdapter for BedrockAdapter {
             })
             .unwrap_or_default();
 
+        let model_name = primary_model_id.unwrap_or_else(|| target_model_id.clone());
+
         Ok(LlmResponse {
             content,
             tool_calls: Vec::new(),
             usage,
             finish_reason,
             refusal: None,
-            model: model_id,
-            reported_model: None,
+            model: model_name,
+            reported_model,
         })
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        Ok(vec![
-            ModelInfo {
-                id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_owned(),
-                description: Some("Anthropic Claude 3.7 Sonnet on Bedrock".to_owned()),
-            },
-            ModelInfo {
-                id: "anthropic.claude-3-5-sonnet-20241022-v2:0".to_owned(),
-                description: Some("Anthropic Claude 3.5 Sonnet v2 on Bedrock".to_owned()),
-            },
-            ModelInfo {
-                id: "anthropic.claude-3-haiku-20240307-v1:0".to_owned(),
-                description: Some("Anthropic Claude 3 Haiku on Bedrock".to_owned()),
-            },
-            ModelInfo {
-                id: "amazon.nova-pro-v1:0".to_owned(),
-                description: Some("Amazon Nova Pro on Bedrock".to_owned()),
-            },
-            ModelInfo {
-                id: "amazon.nova-lite-v1:0".to_owned(),
-                description: Some("Amazon Nova Lite on Bedrock".to_owned()),
-            },
-            ModelInfo {
-                id: "meta.llama3-3-70b-instruct-v1:0".to_owned(),
-                description: Some("Meta Llama 3.3 70B Instruct on Bedrock".to_owned()),
-            },
-        ])
+        let mut models = Vec::new();
+
+        if let Some(ref ip) = self.config.inference_profile {
+            models.push(ModelInfo {
+                id: ip.clone(),
+                description: Some("Configured AWS Bedrock Inference Profile".to_owned()),
+            });
+        }
+
+        let region_prefix = if self.config.region.starts_with("us-") {
+            Some("us.")
+        } else if self.config.region.starts_with("eu-") {
+            Some("eu.")
+        } else if self.config.region.starts_with("ap-") {
+            Some("apac.")
+        } else {
+            None
+        };
+
+        let base_models = [
+            ("anthropic.claude-3-7-sonnet-20250219-v1:0", "Anthropic Claude 3.7 Sonnet on Bedrock"),
+            ("anthropic.claude-3-5-sonnet-20241022-v2:0", "Anthropic Claude 3.5 Sonnet v2 on Bedrock"),
+            ("anthropic.claude-3-haiku-20240307-v1:0", "Anthropic Claude 3 Haiku on Bedrock"),
+            ("amazon.nova-pro-v1:0", "Amazon Nova Pro on Bedrock"),
+            ("amazon.nova-lite-v1:0", "Amazon Nova Lite on Bedrock"),
+            ("meta.llama3-3-70b-instruct-v1:0", "Meta Llama 3.3 70B Instruct on Bedrock"),
+        ];
+
+        for (id, desc) in base_models {
+            if let Some(prefix) = region_prefix {
+                models.push(ModelInfo {
+                    id: format!("{prefix}{id}"),
+                    description: Some(format!("{desc} (Inference Profile)")),
+                });
+            }
+            models.push(ModelInfo {
+                id: id.to_owned(),
+                description: Some(desc.to_owned()),
+            });
+        }
+
+        Ok(models)
     }
 }
 
@@ -378,10 +552,48 @@ mod tests {
 
     #[test]
     fn test_bedrock_config_construction() {
-        let config = BedrockConfig::new("us-west-2");
+        let config = BedrockConfig::new("us-west-2")
+            .with_inference_profile("us.anthropic.claude-3-7-sonnet-20250219-v1:0")
+            .with_endpoint_url("https://custom.bedrock.endpoint")
+            .with_profile_name("custom-profile");
         assert_eq!(config.region, "us-west-2");
-        assert_eq!(config.endpoint_url, None);
-        assert_eq!(config.profile_name, None);
+        assert_eq!(config.endpoint_url.as_deref(), Some("https://custom.bedrock.endpoint"));
+        assert_eq!(config.profile_name.as_deref(), Some("custom-profile"));
+        assert_eq!(
+            config.inference_profile.as_deref(),
+            Some("us.anthropic.claude-3-7-sonnet-20250219-v1:0")
+        );
+    }
+
+    #[test]
+    fn test_bedrock_resolve_inference_profile_priority() {
+        // 1. Explicit profile in model policy takes highest precedence
+        let config = BedrockConfig::new("us-east-1")
+            .with_inference_profile("config-profile");
+        let adapter = BedrockAdapter::new(config, BedrockCredentials::EnvironmentOrProfile).unwrap();
+
+        let mut request = LlmRequest {
+            model_policy: Default::default(),
+            messages: vec![],
+            tools: vec![],
+            response_format: ResponseFormat::Text,
+        };
+        request.model_policy.profile = Some("request-profile".to_owned());
+
+        let resolved = adapter.resolve_inference_profile(&request, Some("anthropic.claude-3-5-sonnet"));
+        assert_eq!(resolved.as_deref(), Some("request-profile"));
+
+        // 2. When request profile is "default" or empty, fallback to config
+        request.model_policy.profile = Some("default".to_owned());
+        let resolved = adapter.resolve_inference_profile(&request, Some("anthropic.claude-3-5-sonnet"));
+        assert_eq!(resolved.as_deref(), Some("config-profile"));
+
+        // 3. Regional fallback when config is None
+        let config2 = BedrockConfig::new("us-east-1");
+        let adapter2 = BedrockAdapter::new(config2, BedrockCredentials::EnvironmentOrProfile).unwrap();
+        request.model_policy.profile = None;
+        let resolved2 = adapter2.resolve_inference_profile(&request, Some("anthropic.claude-3-5-sonnet-20241022-v2:0"));
+        assert_eq!(resolved2.as_deref(), Some("us.anthropic.claude-3-5-sonnet-20241022-v2:0"));
     }
 
     #[test]
@@ -410,6 +622,27 @@ mod tests {
 
         // Ensure client initialization with BearerToken succeeds
         let _client = adapter.client().await;
+    }
+
+    #[tokio::test]
+    async fn test_bedrock_missing_model_and_inference_profile() {
+        let adapter = BedrockAdapter::new(
+            BedrockConfig::new("us-east-1"),
+            BedrockCredentials::EnvironmentOrProfile,
+        )
+        .unwrap();
+
+        let mut request = LlmRequest {
+            model_policy: Default::default(),
+            messages: vec![],
+            tools: vec![],
+            response_format: ResponseFormat::Text,
+        };
+        request.model_policy.profile = None;
+        request.model_policy.model = None;
+
+        let err = adapter.complete(request).await.unwrap_err();
+        assert!(matches!(err, LlmError::Provider(msg) if msg.contains("model ID or inference profile must be specified")));
     }
 
     #[tokio::test]
