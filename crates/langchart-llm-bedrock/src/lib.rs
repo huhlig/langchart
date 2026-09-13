@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use aws_sdk_bedrock::Client as BedrockControlPlaneClient;
 use aws_sdk_bedrockruntime::{
     Client as BedrockClient,
+    error::SdkError,
     operation::converse::ConverseError,
     types::{
         ContentBlock, ConversationRole, ConverseOutput, InferenceConfiguration,
@@ -29,13 +30,14 @@ use aws_sdk_bedrockruntime::{
     },
 };
 use aws_smithy_runtime_api::box_error::BoxError;
-use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
 use aws_smithy_runtime_api::client::interceptors::Intercept;
+use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
 use langchart_adapters::llm::{
-    FinishReason, LlmAdapter, LlmError, LlmRequest, LlmResponse, Message, ModelInfo, ResponseFormat,
-    TokenUsage,
+    FinishReason, LlmAdapter, LlmError, LlmRequest, LlmResponse, Message, ModelInfo,
+    ResponseFormat, TokenUsage, TransportStage,
 };
 use std::collections::HashSet;
 use tokio::sync::OnceCell;
@@ -57,10 +59,7 @@ impl Intercept for BearerTokenInterceptor {
         _cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         let headers = context.request_mut().headers_mut();
-        headers.insert(
-            "authorization",
-            format!("Bearer {}", self.token.trim()),
-        );
+        headers.insert("authorization", format!("Bearer {}", self.token.trim()));
         Ok(())
     }
 }
@@ -179,10 +178,7 @@ pub struct BedrockAdapter {
 
 impl BedrockAdapter {
     /// Creates a new `BedrockAdapter` instance.
-    pub fn new(
-        config: BedrockConfig,
-        credentials: BedrockCredentials,
-    ) -> Result<Self, LlmError> {
+    pub fn new(config: BedrockConfig, credentials: BedrockCredentials) -> Result<Self, LlmError> {
         Ok(Self {
             config,
             credentials,
@@ -326,7 +322,10 @@ impl BedrockAdapter {
                 models.push(ModelInfo {
                     id: summary.inference_profile_id().to_owned(),
                     description: summary.description().map(str::to_owned).or_else(|| {
-                        Some(format!("{} (Inference Profile)", summary.inference_profile_name()))
+                        Some(format!(
+                            "{} (Inference Profile)",
+                            summary.inference_profile_name()
+                        ))
                     }),
                 });
             }
@@ -416,6 +415,58 @@ impl BedrockAdapter {
     }
 }
 
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts = Vec::new();
+    let mut current: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = current {
+        let s = e.to_string();
+        if !s.is_empty() && !parts.contains(&s) {
+            parts.push(s);
+        }
+        current = e.source();
+    }
+    if parts.is_empty() {
+        format!("{err:?}")
+    } else {
+        parts.join(": ")
+    }
+}
+
+fn format_converse_unhandled(err: &ConverseError) -> String {
+    let meta = err.meta();
+    let code = meta.code();
+    let message = meta.message();
+
+    let mut parts = Vec::new();
+
+    match (code, message) {
+        (Some(c), Some(m)) => parts.push(format!("[{c}] {m}")),
+        (Some(c), None) => parts.push(format!("[{c}]")),
+        (None, Some(m)) => parts.push(m.to_owned()),
+        (None, None) => {}
+    }
+
+    let mut current = std::error::Error::source(err);
+    while let Some(e) = current {
+        let s = e.to_string();
+        if !s.is_empty() && !parts.iter().any(|p| p.contains(&s)) {
+            parts.push(s);
+        }
+        current = e.source();
+    }
+
+    if parts.is_empty() {
+        let display = err.to_string();
+        if display.is_empty() || display == "unhandled error" {
+            format!("Bedrock unhandled error: {err:?}")
+        } else {
+            format!("Bedrock provider error: {display}")
+        }
+    } else {
+        format!("Bedrock unhandled error: {}", parts.join(": "))
+    }
+}
+
 fn map_converse_error(err: ConverseError, model_id: &str) -> LlmError {
     match err {
         ConverseError::ThrottlingException(e) => {
@@ -439,7 +490,73 @@ fn map_converse_error(err: ConverseError, model_id: &str) -> LlmError {
                 LlmError::Provider(format!("Bedrock validation error: {msg}"))
             }
         }
-        other => LlmError::Provider(other.to_string()),
+        ConverseError::ModelTimeoutException(e) => {
+            let msg = e.message().unwrap_or("model execution timed out");
+            LlmError::Provider(format!("Bedrock model timed out for `{model_id}`: {msg}"))
+        }
+        ConverseError::InternalServerException(e) => {
+            let msg = e.message().unwrap_or("internal server error");
+            LlmError::Provider(format!("Bedrock internal server error: {msg}"))
+        }
+        ConverseError::ServiceUnavailableException(e) => {
+            let msg = e.message().unwrap_or("service unavailable");
+            LlmError::Provider(format!("Bedrock service unavailable: {msg}"))
+        }
+        ConverseError::ModelErrorException(e) => {
+            let msg = e.message().unwrap_or("model error");
+            LlmError::Provider(format!("Bedrock model error for `{model_id}`: {msg}"))
+        }
+        other => LlmError::Provider(format_converse_unhandled(&other)),
+    }
+}
+
+fn map_bedrock_sdk_error(err: SdkError<ConverseError, HttpResponse>, model_id: &str) -> LlmError {
+    match err {
+        SdkError::TimeoutError(_) => {
+            let cause = format_error_chain(&err);
+            LlmError::Transport {
+                stage: TransportStage::Send,
+                retryable: true,
+                cause: format!("Bedrock request timed out: {cause}"),
+            }
+        }
+        SdkError::DispatchFailure(ref e) => {
+            let stage = if e.is_io() {
+                TransportStage::Connect
+            } else {
+                TransportStage::Send
+            };
+            let cause = format_error_chain(&err);
+            LlmError::Transport {
+                stage,
+                retryable: true,
+                cause: format!("Bedrock dispatch failure: {cause}"),
+            }
+        }
+        SdkError::ResponseError(ref e) => {
+            let status = e.raw().status().as_u16();
+            let cause = format_error_chain(&err);
+            if status == 429 {
+                LlmError::RateLimited(format!("Bedrock rate limited (HTTP 429): {cause}"))
+            } else if status == 408 || status == 504 {
+                LlmError::Transport {
+                    stage: TransportStage::Headers,
+                    retryable: true,
+                    cause: format!("Bedrock gateway/request timeout (HTTP {status}): {cause}"),
+                }
+            } else {
+                LlmError::Provider(format!("Bedrock HTTP {status} response error: {cause}"))
+            }
+        }
+        SdkError::ConstructionFailure(_) => {
+            let cause = format_error_chain(&err);
+            LlmError::Provider(format!("failed to construct Bedrock request: {cause}"))
+        }
+        SdkError::ServiceError(e) => map_converse_error(e.into_err(), model_id),
+        other => {
+            let cause = format_error_chain(&other);
+            LlmError::Provider(format!("Bedrock SDK error: {cause}"))
+        }
     }
 }
 
@@ -455,10 +572,19 @@ fn is_model_denied_or_inference_profile_required(err: &ConverseError) -> bool {
         }
         ConverseError::ResourceNotFoundException(_) => true,
         other => {
-            let msg = other.to_string().to_lowercase();
-            msg.contains("accessdenied")
-                || msg.contains("inference profile")
-                || msg.contains("denied")
+            let meta_code = other.meta().code().unwrap_or("").to_lowercase();
+            let meta_msg = other.meta().message().unwrap_or("").to_lowercase();
+            let display_msg = other.to_string().to_lowercase();
+            meta_code.contains("accessdenied")
+                || meta_code.contains("denied")
+                || meta_msg.contains("accessdenied")
+                || meta_msg.contains("inference profile")
+                || meta_msg.contains("on-demand throughput")
+                || meta_msg.contains("not supported")
+                || meta_msg.contains("denied")
+                || display_msg.contains("accessdenied")
+                || display_msg.contains("inference profile")
+                || display_msg.contains("denied")
         }
     }
 }
@@ -514,7 +640,9 @@ impl LlmAdapter for BedrockAdapter {
                         .role(ConversationRole::User)
                         .content(ContentBlock::Text(content.clone()))
                         .build()
-                        .map_err(|e| LlmError::Provider(format!("failed to build user message: {e}")))?;
+                        .map_err(|e| {
+                            LlmError::Provider(format!("failed to build user message: {e}"))
+                        })?;
                     messages.push(bedrock_msg);
                 }
                 Message::Assistant { content, .. } => {
@@ -532,7 +660,9 @@ impl LlmAdapter for BedrockAdapter {
                         .role(ConversationRole::User)
                         .content(ContentBlock::Text(content.clone()))
                         .build()
-                        .map_err(|e| LlmError::Provider(format!("failed to build tool message: {e}")))?;
+                        .map_err(|e| {
+                            LlmError::Provider(format!("failed to build tool message: {e}"))
+                        })?;
                     messages.push(bedrock_msg);
                 }
             }
@@ -575,30 +705,35 @@ impl LlmAdapter for BedrockAdapter {
                 };
                 (res, reported)
             }
-            Err(err) => {
-                let service_err = err.into_service_error();
-                if is_model_denied_or_inference_profile_required(&service_err) {
-                    if let Some(ref fallback_profile) = fallback_profile_id {
-                        if fallback_profile != &target_model_id {
-                            match send_converse(fallback_profile).send().await {
-                                Ok(res) => (res, Some(fallback_profile.clone())),
-                                Err(retry_err) => {
-                                    return Err(map_converse_error(
-                                        retry_err.into_service_error(),
-                                        fallback_profile,
-                                    ));
+            Err(err) => match err {
+                SdkError::ServiceError(service_err) => {
+                    let converse_err = service_err.into_err();
+                    if is_model_denied_or_inference_profile_required(&converse_err) {
+                        if let Some(ref fallback_profile) = fallback_profile_id {
+                            if fallback_profile != &target_model_id {
+                                match send_converse(fallback_profile).send().await {
+                                    Ok(res) => (res, Some(fallback_profile.clone())),
+                                    Err(retry_err) => {
+                                        return Err(map_bedrock_sdk_error(
+                                            retry_err,
+                                            fallback_profile,
+                                        ));
+                                    }
                                 }
+                            } else {
+                                return Err(map_converse_error(converse_err, &target_model_id));
                             }
                         } else {
-                            return Err(map_converse_error(service_err, &target_model_id));
+                            return Err(map_converse_error(converse_err, &target_model_id));
                         }
                     } else {
-                        return Err(map_converse_error(service_err, &target_model_id));
+                        return Err(map_converse_error(converse_err, &target_model_id));
                     }
-                } else {
-                    return Err(map_converse_error(service_err, &target_model_id));
                 }
-            }
+                other_sdk_err => {
+                    return Err(map_bedrock_sdk_error(other_sdk_err, &target_model_id));
+                }
+            },
         };
 
         let content = match response.output() {
@@ -703,7 +838,10 @@ mod tests {
             .with_model("custom.model-v1")
             .with_models(["custom.model-v2", "custom.model-v3"]);
         assert_eq!(config.region, "us-west-2");
-        assert_eq!(config.endpoint_url.as_deref(), Some("https://custom.bedrock.endpoint"));
+        assert_eq!(
+            config.endpoint_url.as_deref(),
+            Some("https://custom.bedrock.endpoint")
+        );
         assert_eq!(config.profile_name.as_deref(), Some("custom-profile"));
         assert_eq!(
             config.inference_profile.as_deref(),
@@ -717,13 +855,27 @@ mod tests {
 
     #[test]
     fn test_bedrock_is_inference_profile() {
-        assert!(is_inference_profile("us.anthropic.claude-3-7-sonnet-20250219-v1:0"));
-        assert!(is_inference_profile("eu.anthropic.claude-3-5-sonnet-20240620-v1:0"));
-        assert!(is_inference_profile("apac.anthropic.claude-3-5-sonnet-20241022-v2:0"));
-        assert!(is_inference_profile("cr.anthropic.claude-3-5-sonnet-20241022-v2:0"));
-        assert!(is_inference_profile("global.anthropic.claude-3-7-sonnet-20250219-v1:0"));
-        assert!(is_inference_profile("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/my-profile"));
-        assert!(!is_inference_profile("anthropic.claude-3-7-sonnet-20250219-v1:0"));
+        assert!(is_inference_profile(
+            "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        ));
+        assert!(is_inference_profile(
+            "eu.anthropic.claude-3-5-sonnet-20240620-v1:0"
+        ));
+        assert!(is_inference_profile(
+            "apac.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        ));
+        assert!(is_inference_profile(
+            "cr.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        ));
+        assert!(is_inference_profile(
+            "global.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        ));
+        assert!(is_inference_profile(
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/my-profile"
+        ));
+        assert!(!is_inference_profile(
+            "anthropic.claude-3-7-sonnet-20250219-v1:0"
+        ));
         assert!(!is_inference_profile("amazon.nova-pro-v1:0"));
         assert!(!is_inference_profile("meta.llama3-3-70b-instruct-v1:0"));
     }
@@ -731,9 +883,9 @@ mod tests {
     #[test]
     fn test_bedrock_resolve_inference_profile_priority() {
         // 1. Explicit profile in model policy takes highest precedence
-        let config = BedrockConfig::new("us-east-1")
-            .with_inference_profile("config-profile");
-        let adapter = BedrockAdapter::new(config, BedrockCredentials::EnvironmentOrProfile).unwrap();
+        let config = BedrockConfig::new("us-east-1").with_inference_profile("config-profile");
+        let adapter =
+            BedrockAdapter::new(config, BedrockCredentials::EnvironmentOrProfile).unwrap();
 
         let mut request = LlmRequest {
             model_policy: Default::default(),
@@ -743,7 +895,8 @@ mod tests {
         };
         request.model_policy.profile = Some("request-profile".to_owned());
 
-        let resolved = adapter.resolve_inference_profile(&request, Some("anthropic.claude-3-5-sonnet"));
+        let resolved =
+            adapter.resolve_inference_profile(&request, Some("anthropic.claude-3-5-sonnet"));
         assert_eq!(resolved.as_deref(), Some("request-profile"));
 
         // 2. Global inference profile should NOT be prefixed with us.
@@ -768,10 +921,8 @@ mod tests {
         );
 
         // 4. Regional fallback for bare model without prefix
-        let resolved_bare = adapter.resolve_inference_profile(
-            &request,
-            Some("anthropic.claude-3-5-sonnet-20241022-v2:0"),
-        );
+        let resolved_bare = adapter
+            .resolve_inference_profile(&request, Some("anthropic.claude-3-5-sonnet-20241022-v2:0"));
         assert_eq!(
             resolved_bare.as_deref(),
             Some("us.anthropic.claude-3-5-sonnet-20241022-v2:0")
@@ -786,7 +937,8 @@ mod tests {
     fn test_bedrock_multi_model_routing_independence() {
         let config = BedrockConfig::new("us-east-1")
             .with_inference_profile("us.anthropic.claude-3-5-sonnet-20241022-v2:0");
-        let adapter = BedrockAdapter::new(config, BedrockCredentials::EnvironmentOrProfile).unwrap();
+        let adapter =
+            BedrockAdapter::new(config, BedrockCredentials::EnvironmentOrProfile).unwrap();
 
         let request = LlmRequest {
             model_policy: Default::default(),
@@ -810,7 +962,8 @@ mod tests {
         );
 
         // Routing Llama 3.3 regional profile resolves cleanly
-        let llama = adapter.resolve_inference_profile(&request, Some("us.meta.llama3-3-70b-instruct-v1:0"));
+        let llama =
+            adapter.resolve_inference_profile(&request, Some("us.meta.llama3-3-70b-instruct-v1:0"));
         assert_eq!(llama.as_deref(), Some("us.meta.llama3-3-70b-instruct-v1:0"));
     }
 
@@ -860,7 +1013,9 @@ mod tests {
         request.model_policy.model = None;
 
         let err = adapter.complete(request).await.unwrap_err();
-        assert!(matches!(err, LlmError::Provider(msg) if msg.contains("model ID or inference profile must be specified")));
+        assert!(
+            matches!(err, LlmError::Provider(msg) if msg.contains("model ID or inference profile must be specified"))
+        );
     }
 
     #[tokio::test]
@@ -868,7 +1023,10 @@ mod tests {
         let adapter = BedrockAdapter::new(
             BedrockConfig::new("us-east-1")
                 .with_model("custom.arbitrary-future-model")
-                .with_models(["global.anthropic.claude-5-sonnet", "us.anthropic.claude-5-sonnet"])
+                .with_models([
+                    "global.anthropic.claude-5-sonnet",
+                    "us.anthropic.claude-5-sonnet",
+                ])
                 .with_inference_profile("us.custom-application-profile"),
             BedrockCredentials::EnvironmentOrProfile,
         )
@@ -878,10 +1036,26 @@ mod tests {
         assert!(!models.is_empty());
 
         // Configured custom models and profiles are recognized without any static gatekeeping
-        assert!(models.iter().any(|m| m.id == "custom.arbitrary-future-model"));
-        assert!(models.iter().any(|m| m.id == "global.anthropic.claude-5-sonnet"));
-        assert!(models.iter().any(|m| m.id == "us.anthropic.claude-5-sonnet"));
-        assert!(models.iter().any(|m| m.id == "us.custom-application-profile"));
+        assert!(
+            models
+                .iter()
+                .any(|m| m.id == "custom.arbitrary-future-model")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.id == "global.anthropic.claude-5-sonnet")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.id == "us.anthropic.claude-5-sonnet")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.id == "us.custom-application-profile")
+        );
 
         // Deduplication check: every model id in the list must be unique
         let mut seen = HashSet::new();
@@ -931,5 +1105,221 @@ mod tests {
 
         let err = adapter.complete(request).await.unwrap_err();
         assert!(matches!(err, LlmError::Provider(_)));
+    }
+
+    #[test]
+    fn test_unhandled_converse_error() {
+        let meta = aws_smithy_types::error::ErrorMetadata::builder()
+            .code("CustomAWSException")
+            .message("something broke in AWS")
+            .build();
+        let err = ConverseError::generic(meta);
+        println!("display: {}", err);
+        println!("debug: {:?}", err);
+        println!("meta code: {:?}", err.meta().code());
+        println!("meta message: {:?}", err.meta().message());
+
+        let mapped = map_converse_error(err, "test-model");
+        match mapped {
+            LlmError::Provider(msg) => {
+                assert!(msg.contains("CustomAWSException"));
+                assert!(msg.contains("something broke in AWS"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out");
+        let err_unhandled = ConverseError::unhandled(io_err);
+        let mapped_unhandled = map_converse_error(err_unhandled, "test-model");
+        match mapped_unhandled {
+            LlmError::Provider(msg) => {
+                assert!(msg.contains("connection timed out"), "got msg: {msg}");
+                assert!(!msg.ends_with(": unhandled error"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_bedrock_sdk_error_variants() {
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        // 1. ConstructionFailure
+        let construct_err: SdkError<ConverseError, HttpResponse> =
+            SdkError::construction_failure("construction failed");
+        let mapped = map_bedrock_sdk_error(construct_err, "test-model");
+        assert!(
+            matches!(mapped, LlmError::Provider(ref msg) if msg.contains("construction failed"))
+        );
+
+        // 2. TimeoutError
+        let timeout_err: SdkError<ConverseError, HttpResponse> =
+            SdkError::timeout_error("operation timed out after 180s");
+        let mapped = map_bedrock_sdk_error(timeout_err, "test-model");
+        match mapped {
+            LlmError::Transport {
+                stage,
+                retryable,
+                cause,
+            } => {
+                assert_eq!(stage, TransportStage::Send);
+                assert!(retryable);
+                assert!(cause.contains("timed out"), "got cause: {cause}");
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
+
+        // 3. DispatchFailure
+        let connector_err = aws_smithy_runtime_api::client::result::ConnectorError::io(
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )
+            .into(),
+        );
+        let dispatch_err: SdkError<ConverseError, HttpResponse> =
+            SdkError::dispatch_failure(connector_err);
+        let mapped = map_bedrock_sdk_error(dispatch_err, "test-model");
+        match mapped {
+            LlmError::Transport {
+                retryable, cause, ..
+            } => {
+                assert!(retryable);
+                assert!(
+                    cause.contains("connection reset by peer"),
+                    "got cause: {cause}"
+                );
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
+
+        // 4. ResponseError (HTTP 429)
+        let http_res_429 = HttpResponse::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(429).unwrap(),
+            aws_smithy_types::body::SdkBody::empty(),
+        );
+        let resp_err_429: SdkError<ConverseError, HttpResponse> =
+            SdkError::response_error("rate limit body", http_res_429);
+        let mapped = map_bedrock_sdk_error(resp_err_429, "test-model");
+        assert!(matches!(mapped, LlmError::RateLimited(ref msg) if msg.contains("429")));
+
+        // 5. ResponseError (HTTP 504)
+        let http_res_504 = HttpResponse::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(504).unwrap(),
+            aws_smithy_types::body::SdkBody::empty(),
+        );
+        let resp_err_504: SdkError<ConverseError, HttpResponse> =
+            SdkError::response_error("gateway timeout", http_res_504);
+        let mapped = map_bedrock_sdk_error(resp_err_504, "test-model");
+        assert!(matches!(
+            mapped,
+            LlmError::Transport {
+                stage: TransportStage::Headers,
+                retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_is_model_denied_or_inference_profile_required_meta() {
+        let meta = aws_smithy_types::error::ErrorMetadata::builder()
+            .code("AccessDeniedException")
+            .message("You don't have access to this model")
+            .build();
+        let err = ConverseError::generic(meta);
+        assert!(is_model_denied_or_inference_profile_required(&err));
+
+        let meta2 = aws_smithy_types::error::ErrorMetadata::builder()
+            .code("ValidationException")
+            .message("Invocation through on-demand throughput isn't supported. Please use an inference profile.")
+            .build();
+        let err2 = ConverseError::generic(meta2);
+        assert!(is_model_denied_or_inference_profile_required(&err2));
+    }
+
+    #[test]
+    fn test_map_converse_modeled_variants() {
+        use aws_sdk_bedrockruntime::types::error::{
+            InternalServerException, ModelErrorException, ModelNotReadyException,
+            ModelTimeoutException, ResourceNotFoundException, ServiceUnavailableException,
+            ThrottlingException, ValidationException,
+        };
+
+        let err = ConverseError::ThrottlingException(
+            ThrottlingException::builder()
+                .message("too many requests")
+                .build(),
+        );
+        assert!(matches!(
+            map_converse_error(err, "m"),
+            LlmError::RateLimited(_)
+        ));
+
+        let err = ConverseError::ModelNotReadyException(
+            ModelNotReadyException::builder()
+                .message("not ready")
+                .build(),
+        );
+        assert!(matches!(
+            map_converse_error(err, "m"),
+            LlmError::ModelNotFound { .. }
+        ));
+
+        let err = ConverseError::ResourceNotFoundException(
+            ResourceNotFoundException::builder()
+                .message("not found")
+                .build(),
+        );
+        assert!(matches!(
+            map_converse_error(err, "m"),
+            LlmError::ModelNotFound { .. }
+        ));
+
+        let err = ConverseError::ValidationException(
+            ValidationException::builder()
+                .message("max tokens exceeds context length")
+                .build(),
+        );
+        assert!(matches!(
+            map_converse_error(err, "m"),
+            LlmError::ContextLengthExceeded
+        ));
+
+        let err = ConverseError::ModelTimeoutException(
+            ModelTimeoutException::builder()
+                .message("took too long")
+                .build(),
+        );
+        assert!(
+            matches!(map_converse_error(err, "m"), LlmError::Provider(ref msg) if msg.contains("timed out"))
+        );
+
+        let err = ConverseError::InternalServerException(
+            InternalServerException::builder()
+                .message("internal failure")
+                .build(),
+        );
+        assert!(
+            matches!(map_converse_error(err, "m"), LlmError::Provider(ref msg) if msg.contains("internal server error"))
+        );
+
+        let err = ConverseError::ServiceUnavailableException(
+            ServiceUnavailableException::builder()
+                .message("down for maintenance")
+                .build(),
+        );
+        assert!(
+            matches!(map_converse_error(err, "m"), LlmError::Provider(ref msg) if msg.contains("service unavailable"))
+        );
+
+        let err = ConverseError::ModelErrorException(
+            ModelErrorException::builder()
+                .message("model crashed")
+                .build(),
+        );
+        assert!(
+            matches!(map_converse_error(err, "m"), LlmError::Provider(ref msg) if msg.contains("model error"))
+        );
     }
 }

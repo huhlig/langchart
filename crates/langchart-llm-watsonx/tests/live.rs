@@ -37,11 +37,7 @@ async fn test_live_watsonx() {
         .unwrap_or_else(|_| "https://us-south.ml.cloud.ibm.com".to_string());
 
     let adapter = WatsonxAdapter::new(
-        WatsonxConfig::new(
-            service_url,
-            "2024-05-31",
-            WatsonxScope::Project(project_id),
-        ),
+        WatsonxConfig::new(service_url, "2024-05-31", WatsonxScope::Project(project_id)),
         WatsonxCredentials::ApiKey(api_key),
     )
     .unwrap();

@@ -76,7 +76,8 @@ async fn test_live_bedrock_environment_bearer_token() {
     let mut request = LlmRequest {
         model_policy: Default::default(),
         messages: vec![Message::User {
-            content: "Say 'Env bearer token authentication succeeded!' and nothing else.".to_owned(),
+            content: "Say 'Env bearer token authentication succeeded!' and nothing else."
+                .to_owned(),
         }],
         tools: vec![],
         response_format: ResponseFormat::Text,

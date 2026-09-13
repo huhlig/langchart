@@ -430,7 +430,9 @@ impl WatsonxUsage {
     }
 
     fn completion(&self) -> u32 {
-        self.completion_tokens.or(self.generated_tokens).unwrap_or(0)
+        self.completion_tokens
+            .or(self.generated_tokens)
+            .unwrap_or(0)
     }
 
     fn total(&self) -> Option<u32> {
@@ -1127,4 +1129,3 @@ mod tests {
         );
     }
 }
-
