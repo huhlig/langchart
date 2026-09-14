@@ -24,9 +24,11 @@ use aws_sdk_bedrockruntime::{
     Client as BedrockClient,
     error::SdkError,
     operation::converse::ConverseError,
+    operation::converse_stream::ConverseStreamError,
     types::{
-        ContentBlock, ConversationRole, ConverseOutput, InferenceConfiguration,
-        Message as BedrockMessage, StopReason, SystemContentBlock,
+        ContentBlock, ContentBlockDelta, ConversationRole, ConverseStreamOutput,
+        InferenceConfiguration, Message as BedrockMessage, StopReason, SystemContentBlock,
+        error::ConverseStreamOutputError,
     },
 };
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -35,11 +37,12 @@ use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterce
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
+use futures::StreamExt;
 use langchart_adapters::llm::{
-    FinishReason, LlmAdapter, LlmError, LlmRequest, LlmResponse, Message, ModelInfo,
-    ResponseFormat, TokenUsage, TransportStage,
+    FinishReason, LlmAdapter, LlmError, LlmEventStream, LlmRequest, LlmResponse, LlmStreamEvent,
+    Message, ModelInfo, ResponseFormat, TokenUsage, TransportStage,
 };
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use tokio::sync::OnceCell;
 
 #[derive(Debug)]
@@ -80,6 +83,8 @@ pub struct BedrockConfig {
     pub inference_profile: Option<String>,
     /// Optional list of recognized model IDs or inference profile IDs.
     pub models: Vec<String>,
+    /// Optional client-side request timeout in seconds.
+    pub request_timeout_seconds: Option<u64>,
 }
 
 impl BedrockConfig {
@@ -92,6 +97,7 @@ impl BedrockConfig {
             profile_name: None,
             inference_profile: None,
             models: Vec::new(),
+            request_timeout_seconds: None,
         }
     }
 
@@ -131,6 +137,13 @@ impl BedrockConfig {
     #[must_use]
     pub fn with_profile_name(mut self, profile_name: impl Into<String>) -> Self {
         self.profile_name = Some(profile_name.into());
+        self
+    }
+
+    /// Sets an optional client-side request timeout in seconds.
+    #[must_use]
+    pub fn with_request_timeout_seconds(mut self, timeout_seconds: u64) -> Self {
+        self.request_timeout_seconds = Some(timeout_seconds);
         self
     }
 }
@@ -200,6 +213,15 @@ impl BedrockAdapter {
                 }
                 if let Some(profile) = &self.config.profile_name {
                     config_loader = config_loader.profile_name(profile);
+                }
+                if let Some(timeout_secs) = self.config.request_timeout_seconds {
+                    let dur = std::time::Duration::from_secs(timeout_secs);
+                    let timeout_config = aws_config::timeout::TimeoutConfig::builder()
+                        .operation_timeout(dur)
+                        .operation_attempt_timeout(dur)
+                        .read_timeout(dur)
+                        .build();
+                    config_loader = config_loader.timeout_config(timeout_config);
                 }
 
                 let bearer_token = match &self.credentials {
@@ -277,6 +299,15 @@ impl BedrockAdapter {
                         if let Some(endpoint) = &self.config.endpoint_url {
                             config_loader = config_loader.endpoint_url(endpoint);
                         }
+                        if let Some(timeout_secs) = self.config.request_timeout_seconds {
+                            let dur = std::time::Duration::from_secs(timeout_secs);
+                            let timeout_config = aws_config::timeout::TimeoutConfig::builder()
+                                .operation_timeout(dur)
+                                .operation_attempt_timeout(dur)
+                                .read_timeout(dur)
+                                .build();
+                            config_loader = config_loader.timeout_config(timeout_config);
+                        }
                         let sdk_config = config_loader.load().await;
                         Some(BedrockControlPlaneClient::new(&sdk_config))
                     }
@@ -299,6 +330,15 @@ impl BedrockAdapter {
                         }
                         if let Some(profile) = &self.config.profile_name {
                             config_loader = config_loader.profile_name(profile);
+                        }
+                        if let Some(timeout_secs) = self.config.request_timeout_seconds {
+                            let dur = std::time::Duration::from_secs(timeout_secs);
+                            let timeout_config = aws_config::timeout::TimeoutConfig::builder()
+                                .operation_timeout(dur)
+                                .operation_attempt_timeout(dur)
+                                .read_timeout(dur)
+                                .build();
+                            config_loader = config_loader.timeout_config(timeout_config);
                         }
                         let sdk_config = config_loader.load().await;
                         Some(BedrockControlPlaneClient::new(&sdk_config))
@@ -432,6 +472,7 @@ fn format_error_chain(err: &dyn std::error::Error) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn format_converse_unhandled(err: &ConverseError) -> String {
     let meta = err.meta();
     let code = meta.code();
@@ -467,6 +508,7 @@ fn format_converse_unhandled(err: &ConverseError) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn map_converse_error(err: ConverseError, model_id: &str) -> LlmError {
     match err {
         ConverseError::ThrottlingException(e) => {
@@ -510,6 +552,7 @@ fn map_converse_error(err: ConverseError, model_id: &str) -> LlmError {
     }
 }
 
+#[allow(dead_code)]
 fn map_bedrock_sdk_error(err: SdkError<ConverseError, HttpResponse>, model_id: &str) -> LlmError {
     match err {
         SdkError::TimeoutError(_) => {
@@ -560,6 +603,7 @@ fn map_bedrock_sdk_error(err: SdkError<ConverseError, HttpResponse>, model_id: &
     }
 }
 
+#[allow(dead_code)]
 fn is_model_denied_or_inference_profile_required(err: &ConverseError) -> bool {
     match err {
         ConverseError::AccessDeniedException(_) => true,
@@ -589,9 +633,276 @@ fn is_model_denied_or_inference_profile_required(err: &ConverseError) -> bool {
     }
 }
 
+fn format_converse_stream_unhandled(err: &ConverseStreamError) -> String {
+    let meta = err.meta();
+    let code = meta.code();
+    let message = meta.message();
+
+    let mut parts = Vec::new();
+
+    match (code, message) {
+        (Some(c), Some(m)) => parts.push(format!("[{c}] {m}")),
+        (Some(c), None) => parts.push(format!("[{c}]")),
+        (None, Some(m)) => parts.push(m.to_owned()),
+        (None, None) => {}
+    }
+
+    let mut current = std::error::Error::source(err);
+    while let Some(e) = current {
+        let s = e.to_string();
+        if !s.is_empty() && !parts.iter().any(|p| p.contains(&s)) {
+            parts.push(s);
+        }
+        current = e.source();
+    }
+
+    if parts.is_empty() {
+        let display = err.to_string();
+        if display.is_empty() || display == "unhandled error" {
+            format!("Bedrock unhandled error: {err:?}")
+        } else {
+            format!("Bedrock provider error: {display}")
+        }
+    } else {
+        format!("Bedrock unhandled error: {}", parts.join(": "))
+    }
+}
+
+fn map_converse_stream_error(err: ConverseStreamError, model_id: &str) -> LlmError {
+    match err {
+        ConverseStreamError::ThrottlingException(e) => {
+            LlmError::RateLimited(e.message().unwrap_or("throttled by Bedrock").to_owned())
+        }
+        ConverseStreamError::ModelNotReadyException(e) => LlmError::ModelNotFound {
+            model: e.message().unwrap_or(model_id).to_owned(),
+        },
+        ConverseStreamError::ResourceNotFoundException(e) => LlmError::ModelNotFound {
+            model: e.message().unwrap_or(model_id).to_owned(),
+        },
+        ConverseStreamError::AccessDeniedException(e) => {
+            let msg = e.message().unwrap_or("access denied to Bedrock model");
+            LlmError::Provider(format!("Bedrock access denied for `{model_id}`: {msg}"))
+        }
+        ConverseStreamError::ValidationException(e) => {
+            let msg = e.message().unwrap_or("validation error");
+            if msg.contains("context length") || msg.contains("max tokens") {
+                LlmError::ContextLengthExceeded
+            } else {
+                LlmError::Provider(format!("Bedrock validation error: {msg}"))
+            }
+        }
+        ConverseStreamError::ModelTimeoutException(e) => {
+            let msg = e.message().unwrap_or("model execution timed out");
+            LlmError::Provider(format!("Bedrock model timed out for `{model_id}`: {msg}"))
+        }
+        ConverseStreamError::InternalServerException(e) => {
+            let msg = e.message().unwrap_or("internal server error");
+            LlmError::Provider(format!("Bedrock internal server error: {msg}"))
+        }
+        ConverseStreamError::ServiceUnavailableException(e) => {
+            let msg = e.message().unwrap_or("service unavailable");
+            LlmError::Provider(format!("Bedrock service unavailable: {msg}"))
+        }
+        ConverseStreamError::ModelErrorException(e) => {
+            let msg = e.message().unwrap_or("model error");
+            LlmError::Provider(format!("Bedrock model error for `{model_id}`: {msg}"))
+        }
+        other => LlmError::Provider(format_converse_stream_unhandled(&other)),
+    }
+}
+
+fn map_converse_stream_output_error(err: ConverseStreamOutputError, model_id: &str) -> LlmError {
+    match err {
+        ConverseStreamOutputError::ThrottlingException(e) => {
+            LlmError::RateLimited(e.message().unwrap_or("throttled by Bedrock").to_owned())
+        }
+        ConverseStreamOutputError::ValidationException(e) => {
+            let msg = e.message().unwrap_or("validation error");
+            if msg.contains("context length") || msg.contains("max tokens") {
+                LlmError::ContextLengthExceeded
+            } else {
+                LlmError::Provider(format!("Bedrock validation error in stream: {msg}"))
+            }
+        }
+        ConverseStreamOutputError::ModelStreamErrorException(e) => {
+            let msg = e.message().unwrap_or("model stream error");
+            LlmError::Provider(format!(
+                "Bedrock model stream error for `{model_id}`: {msg}"
+            ))
+        }
+        ConverseStreamOutputError::InternalServerException(e) => {
+            let msg = e.message().unwrap_or("internal server error");
+            LlmError::Provider(format!("Bedrock internal server error: {msg}"))
+        }
+        ConverseStreamOutputError::ServiceUnavailableException(e) => {
+            let msg = e.message().unwrap_or("service unavailable");
+            LlmError::Provider(format!("Bedrock service unavailable: {msg}"))
+        }
+        other => LlmError::Provider(format_error_chain(&other)),
+    }
+}
+
+fn map_converse_stream_output_sdk_error<R: std::fmt::Debug>(
+    err: SdkError<ConverseStreamOutputError, R>,
+    model_id: &str,
+) -> LlmError {
+    match err {
+        SdkError::TimeoutError(_) => {
+            let cause = format_error_chain(&err);
+            LlmError::Transport {
+                stage: TransportStage::Body,
+                retryable: true,
+                cause: format!("Bedrock stream timed out: {cause}"),
+            }
+        }
+        SdkError::DispatchFailure(ref e) => {
+            let stage = if e.is_io() {
+                TransportStage::Connect
+            } else {
+                TransportStage::Body
+            };
+            let cause = format_error_chain(&err);
+            LlmError::Transport {
+                stage,
+                retryable: true,
+                cause: format!("Bedrock stream dispatch failure: {cause}"),
+            }
+        }
+        SdkError::ResponseError(ref _e) => {
+            let cause = format_error_chain(&err);
+            LlmError::Provider(format!("Bedrock stream response error: {cause}"))
+        }
+        SdkError::ServiceError(e) => map_converse_stream_output_error(e.into_err(), model_id),
+        other => {
+            let cause = format_error_chain(&other);
+            LlmError::Provider(format!("Bedrock stream error: {cause}"))
+        }
+    }
+}
+
+fn map_bedrock_stream_sdk_error(
+    err: SdkError<ConverseStreamError, HttpResponse>,
+    model_id: &str,
+) -> LlmError {
+    match err {
+        SdkError::TimeoutError(_) => {
+            let cause = format_error_chain(&err);
+            LlmError::Transport {
+                stage: TransportStage::Send,
+                retryable: true,
+                cause: format!("Bedrock request timed out: {cause}"),
+            }
+        }
+        SdkError::DispatchFailure(ref e) => {
+            let stage = if e.is_io() {
+                TransportStage::Connect
+            } else {
+                TransportStage::Send
+            };
+            let cause = format_error_chain(&err);
+            LlmError::Transport {
+                stage,
+                retryable: true,
+                cause: format!("Bedrock dispatch failure: {cause}"),
+            }
+        }
+        SdkError::ResponseError(ref e) => {
+            let status = e.raw().status().as_u16();
+            let cause = format_error_chain(&err);
+            if status == 429 {
+                LlmError::RateLimited(format!("Bedrock rate limited (HTTP 429): {cause}"))
+            } else if status == 408 || status == 504 {
+                LlmError::Transport {
+                    stage: TransportStage::Headers,
+                    retryable: true,
+                    cause: format!("Bedrock gateway/request timeout (HTTP {status}): {cause}"),
+                }
+            } else {
+                LlmError::Provider(format!("Bedrock HTTP {status} response error: {cause}"))
+            }
+        }
+        SdkError::ConstructionFailure(_) => {
+            let cause = format_error_chain(&err);
+            LlmError::Provider(format!(
+                "failed to construct Bedrock stream request: {cause}"
+            ))
+        }
+        SdkError::ServiceError(e) => map_converse_stream_error(e.into_err(), model_id),
+        other => {
+            let cause = format_error_chain(&other);
+            LlmError::Provider(format!("Bedrock stream SDK error: {cause}"))
+        }
+    }
+}
+
+fn is_stream_model_denied_or_inference_profile_required(err: &ConverseStreamError) -> bool {
+    match err {
+        ConverseStreamError::AccessDeniedException(_) => true,
+        ConverseStreamError::ValidationException(e) => {
+            let msg = e.message().unwrap_or("").to_lowercase();
+            msg.contains("inference profile")
+                || msg.contains("on-demand throughput")
+                || msg.contains("not supported")
+                || msg.contains("denied")
+        }
+        ConverseStreamError::ResourceNotFoundException(_) => true,
+        other => {
+            let meta_code = other.meta().code().unwrap_or("").to_lowercase();
+            let meta_msg = other.meta().message().unwrap_or("").to_lowercase();
+            let display_msg = other.to_string().to_lowercase();
+            meta_code.contains("accessdenied")
+                || meta_code.contains("denied")
+                || meta_msg.contains("accessdenied")
+                || meta_msg.contains("inference profile")
+                || meta_msg.contains("on-demand throughput")
+                || meta_msg.contains("not supported")
+                || meta_msg.contains("denied")
+                || display_msg.contains("accessdenied")
+                || display_msg.contains("inference profile")
+                || display_msg.contains("denied")
+        }
+    }
+}
+
+fn map_stop_reason(reason: &StopReason) -> FinishReason {
+    match reason {
+        StopReason::EndTurn | StopReason::StopSequence => FinishReason::Stop,
+        StopReason::MaxTokens => FinishReason::Length,
+        StopReason::ContentFiltered | StopReason::GuardrailIntervened => {
+            FinishReason::ContentFilter
+        }
+        StopReason::ToolUse => FinishReason::ToolCalls,
+        other => FinishReason::Other(other.as_str().to_owned()),
+    }
+}
+
+fn map_token_usage(u: &aws_sdk_bedrockruntime::types::TokenUsage) -> TokenUsage {
+    TokenUsage {
+        prompt_tokens: u32::try_from(u.input_tokens()).unwrap_or(u32::MAX),
+        completion_tokens: u32::try_from(u.output_tokens()).unwrap_or(u32::MAX),
+        total_tokens: u32::try_from(u.total_tokens()).unwrap_or(u32::MAX),
+    }
+}
+
+async fn collect_completed_response(mut stream: LlmEventStream) -> Result<LlmResponse, LlmError> {
+    while let Some(event) = stream.next().await {
+        if let LlmStreamEvent::ResponseCompleted { response } = event? {
+            return Ok(response);
+        }
+    }
+    Err(LlmError::IncompleteStream {
+        received_bytes: 0,
+        finish_event_seen: false,
+    })
+}
+
 #[async_trait]
 impl LlmAdapter for BedrockAdapter {
     async fn complete(&self, request: LlmRequest) -> Result<LlmResponse, LlmError> {
+        collect_completed_response(self.complete_stream(request).await?).await
+    }
+
+    async fn complete_stream(&self, request: LlmRequest) -> Result<LlmEventStream, LlmError> {
         if request.response_format != ResponseFormat::Text {
             return Err(LlmError::UnsupportedResponseFormat {
                 adapter: "bedrock".to_owned(),
@@ -683,106 +994,186 @@ impl LlmAdapter for BedrockAdapter {
 
         let client = self.client().await;
 
-        let send_converse = |model_to_use: &str| {
-            let mut converse_builder = client
-                .converse()
+        let send_converse_stream = |model_to_use: &str| {
+            let mut converse_stream_builder = client
+                .converse_stream()
                 .model_id(model_to_use)
                 .set_messages(Some(messages.clone()))
                 .inference_config(inference_config.clone());
 
             if !system_blocks.is_empty() {
-                converse_builder = converse_builder.set_system(Some(system_blocks.clone()));
+                converse_stream_builder =
+                    converse_stream_builder.set_system(Some(system_blocks.clone()));
             }
-            converse_builder
+            converse_stream_builder
         };
 
-        let (response, reported_model) = match send_converse(&target_model_id).send().await {
-            Ok(res) => {
-                let reported = if primary_model_id.is_none() {
-                    Some(target_model_id.clone())
-                } else {
-                    None
-                };
-                (res, reported)
-            }
-            Err(err) => match err {
-                SdkError::ServiceError(service_err) => {
-                    let converse_err = service_err.into_err();
-                    if is_model_denied_or_inference_profile_required(&converse_err) {
-                        if let Some(ref fallback_profile) = fallback_profile_id {
-                            if fallback_profile != &target_model_id {
-                                match send_converse(fallback_profile).send().await {
-                                    Ok(res) => (res, Some(fallback_profile.clone())),
-                                    Err(retry_err) => {
-                                        return Err(map_bedrock_sdk_error(
-                                            retry_err,
-                                            fallback_profile,
-                                        ));
+        let (stream_output, reported_model, effective_model_id) =
+            match send_converse_stream(&target_model_id).send().await {
+                Ok(res) => {
+                    let reported = if primary_model_id.is_none() {
+                        Some(target_model_id.clone())
+                    } else {
+                        None
+                    };
+                    (res, reported, target_model_id.clone())
+                }
+                Err(err) => match err {
+                    SdkError::ServiceError(service_err) => {
+                        let stream_err = service_err.into_err();
+                        if is_stream_model_denied_or_inference_profile_required(&stream_err) {
+                            if let Some(ref fallback_profile) = fallback_profile_id {
+                                if fallback_profile != &target_model_id {
+                                    match send_converse_stream(fallback_profile).send().await {
+                                        Ok(res) => (
+                                            res,
+                                            Some(fallback_profile.clone()),
+                                            fallback_profile.clone(),
+                                        ),
+                                        Err(retry_err) => {
+                                            return Err(map_bedrock_stream_sdk_error(
+                                                retry_err,
+                                                fallback_profile,
+                                            ));
+                                        }
                                     }
+                                } else {
+                                    return Err(map_converse_stream_error(
+                                        stream_err,
+                                        &target_model_id,
+                                    ));
                                 }
                             } else {
-                                return Err(map_converse_error(converse_err, &target_model_id));
+                                return Err(map_converse_stream_error(
+                                    stream_err,
+                                    &target_model_id,
+                                ));
                             }
                         } else {
-                            return Err(map_converse_error(converse_err, &target_model_id));
+                            return Err(map_converse_stream_error(stream_err, &target_model_id));
                         }
-                    } else {
-                        return Err(map_converse_error(converse_err, &target_model_id));
                     }
-                }
-                other_sdk_err => {
-                    return Err(map_bedrock_sdk_error(other_sdk_err, &target_model_id));
-                }
-            },
-        };
-
-        let content = match response.output() {
-            Some(ConverseOutput::Message(msg)) => {
-                let mut text_parts = Vec::new();
-                for block in msg.content() {
-                    if let ContentBlock::Text(text) = block {
-                        text_parts.push(text.as_str());
+                    other_sdk_err => {
+                        return Err(map_bedrock_stream_sdk_error(
+                            other_sdk_err,
+                            &target_model_id,
+                        ));
                     }
-                }
-                if text_parts.is_empty() {
-                    None
-                } else {
-                    Some(text_parts.join(""))
-                }
-            }
-            _ => None,
-        };
+                },
+            };
 
-        let finish_reason = match response.stop_reason() {
-            StopReason::EndTurn | StopReason::StopSequence => FinishReason::Stop,
-            StopReason::MaxTokens => FinishReason::Length,
-            StopReason::ContentFiltered | StopReason::GuardrailIntervened => {
-                FinishReason::ContentFilter
-            }
-            StopReason::ToolUse => FinishReason::ToolCalls,
-            other => FinishReason::Other(other.as_str().to_owned()),
-        };
+        let model_name = primary_model_id.unwrap_or_else(|| effective_model_id.clone());
 
-        let usage = response
-            .usage()
-            .map(|u| TokenUsage {
-                prompt_tokens: u32::try_from(u.input_tokens()).unwrap_or(u32::MAX),
-                completion_tokens: u32::try_from(u.output_tokens()).unwrap_or(u32::MAX),
-                total_tokens: u32::try_from(u.total_tokens()).unwrap_or(u32::MAX),
-            })
-            .unwrap_or_default();
+        struct BedrockStreamState<S> {
+            stream: S,
+            target_model_id: String,
+            reported_model: Option<String>,
+            resolved_model_name: String,
+            queue: VecDeque<Result<LlmStreamEvent, LlmError>>,
+            accumulated_text: String,
+            accumulated_usage: TokenUsage,
+            accumulated_finish_reason: Option<FinishReason>,
+            started: bool,
+            done: bool,
+        }
 
-        let model_name = primary_model_id.unwrap_or_else(|| target_model_id.clone());
-
-        Ok(LlmResponse {
-            content,
-            tool_calls: Vec::new(),
-            usage,
-            finish_reason,
-            refusal: None,
-            model: model_name,
+        let state = BedrockStreamState {
+            stream: stream_output.stream,
+            target_model_id: effective_model_id,
             reported_model,
-        })
+            resolved_model_name: model_name,
+            queue: VecDeque::new(),
+            accumulated_text: String::new(),
+            accumulated_usage: TokenUsage::default(),
+            accumulated_finish_reason: None,
+            started: false,
+            done: false,
+        };
+
+        let event_stream = futures::stream::unfold(state, |mut state| async move {
+            loop {
+                if let Some(item) = state.queue.pop_front() {
+                    return Some((item, state));
+                }
+                if state.done {
+                    return None;
+                }
+
+                if !state.started {
+                    state.started = true;
+                    state.queue.push_back(Ok(LlmStreamEvent::ResponseStarted {
+                        request_id: None,
+                        reported_model: state.reported_model.clone(),
+                    }));
+                    continue;
+                }
+
+                match state.stream.recv().await {
+                    Ok(Some(output)) => match output {
+                        ConverseStreamOutput::ContentBlockDelta(event) => {
+                            if let Some(delta) = event.delta() {
+                                if let ContentBlockDelta::Text(text) = delta {
+                                    state.accumulated_text.push_str(text);
+                                    state.queue.push_back(Ok(LlmStreamEvent::TextDelta {
+                                        delta: text.clone(),
+                                    }));
+                                }
+                            }
+                        }
+                        ConverseStreamOutput::MessageStop(event) => {
+                            let finish_reason = map_stop_reason(event.stop_reason());
+                            state.accumulated_finish_reason = Some(finish_reason.clone());
+                            state.queue.push_back(Ok(LlmStreamEvent::FinishReason {
+                                reason: finish_reason,
+                            }));
+                        }
+                        ConverseStreamOutput::Metadata(event) => {
+                            if let Some(u) = event.usage() {
+                                let token_usage = map_token_usage(u);
+                                state.accumulated_usage = token_usage.clone();
+                                state.queue.push_back(Ok(LlmStreamEvent::UsageUpdate {
+                                    usage: token_usage,
+                                }));
+                            }
+                        }
+                        _ => {}
+                    },
+                    Ok(None) => {
+                        state.done = true;
+                        let final_response = LlmResponse {
+                            content: if state.accumulated_text.is_empty() {
+                                None
+                            } else {
+                                Some(state.accumulated_text.clone())
+                            },
+                            tool_calls: Vec::new(),
+                            usage: state.accumulated_usage.clone(),
+                            finish_reason: state
+                                .accumulated_finish_reason
+                                .clone()
+                                .unwrap_or(FinishReason::Stop),
+                            refusal: None,
+                            model: state.resolved_model_name.clone(),
+                            reported_model: state.reported_model.clone(),
+                        };
+                        state.queue.push_back(Ok(LlmStreamEvent::ResponseCompleted {
+                            response: final_response,
+                        }));
+                    }
+                    Err(stream_err) => {
+                        state.done = true;
+                        state
+                            .queue
+                            .push_back(Err(map_converse_stream_output_sdk_error(
+                                stream_err,
+                                &state.target_model_id,
+                            )));
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(event_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
@@ -1320,6 +1711,122 @@ mod tests {
         );
         assert!(
             matches!(map_converse_error(err, "m"), LlmError::Provider(ref msg) if msg.contains("model error"))
+        );
+    }
+
+    #[test]
+    fn test_bedrock_config_request_timeout_seconds() {
+        let config = BedrockConfig::new("us-east-1").with_request_timeout_seconds(120);
+        assert_eq!(config.request_timeout_seconds, Some(120));
+
+        let default_config = BedrockConfig::new("us-east-1");
+        assert_eq!(default_config.request_timeout_seconds, None);
+    }
+
+    #[tokio::test]
+    async fn test_collect_completed_response_success() {
+        let response = LlmResponse {
+            content: Some("hello world".into()),
+            tool_calls: vec![],
+            usage: TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+            },
+            finish_reason: FinishReason::Stop,
+            refusal: None,
+            model: "anthropic.claude-3-5-sonnet".into(),
+            reported_model: None,
+        };
+
+        let stream: LlmEventStream = Box::pin(futures::stream::iter(vec![
+            Ok(LlmStreamEvent::ResponseStarted {
+                request_id: None,
+                reported_model: None,
+            }),
+            Ok(LlmStreamEvent::TextDelta {
+                delta: "hello ".into(),
+            }),
+            Ok(LlmStreamEvent::TextDelta {
+                delta: "world".into(),
+            }),
+            Ok(LlmStreamEvent::FinishReason {
+                reason: FinishReason::Stop,
+            }),
+            Ok(LlmStreamEvent::ResponseCompleted {
+                response: response.clone(),
+            }),
+        ]));
+
+        let collected = collect_completed_response(stream).await.unwrap();
+        assert_eq!(collected.content, Some("hello world".into()));
+        assert_eq!(collected.finish_reason, FinishReason::Stop);
+        assert_eq!(collected.usage.total_tokens, 12);
+    }
+
+    #[tokio::test]
+    async fn test_collect_completed_response_incomplete() {
+        let stream: LlmEventStream = Box::pin(futures::stream::iter(vec![
+            Ok(LlmStreamEvent::ResponseStarted {
+                request_id: None,
+                reported_model: None,
+            }),
+            Ok(LlmStreamEvent::TextDelta {
+                delta: "partial output".into(),
+            }),
+        ]));
+
+        let err = collect_completed_response(stream).await.unwrap_err();
+        assert!(matches!(err, LlmError::IncompleteStream { .. }));
+    }
+
+    #[test]
+    fn test_map_converse_stream_modeled_variants() {
+        use aws_sdk_bedrockruntime::types::error::{
+            AccessDeniedException, InternalServerException, ModelTimeoutException,
+            ThrottlingException, ValidationException,
+        };
+
+        let err = ConverseStreamError::ThrottlingException(
+            ThrottlingException::builder().message("too fast").build(),
+        );
+        assert!(
+            matches!(map_converse_stream_error(err, "m"), LlmError::RateLimited(ref msg) if msg == "too fast")
+        );
+
+        let err = ConverseStreamError::AccessDeniedException(
+            AccessDeniedException::builder().message("denied").build(),
+        );
+        assert!(
+            matches!(map_converse_stream_error(err, "m"), LlmError::Provider(ref msg) if msg.contains("denied"))
+        );
+
+        let err = ConverseStreamError::ValidationException(
+            ValidationException::builder()
+                .message("max tokens exceeds context length")
+                .build(),
+        );
+        assert!(matches!(
+            map_converse_stream_error(err, "m"),
+            LlmError::ContextLengthExceeded
+        ));
+
+        let err = ConverseStreamError::ModelTimeoutException(
+            ModelTimeoutException::builder()
+                .message("stream timeout")
+                .build(),
+        );
+        assert!(
+            matches!(map_converse_stream_error(err, "m"), LlmError::Provider(ref msg) if msg.contains("timed out"))
+        );
+
+        let err = ConverseStreamError::InternalServerException(
+            InternalServerException::builder()
+                .message("internal error")
+                .build(),
+        );
+        assert!(
+            matches!(map_converse_stream_error(err, "m"), LlmError::Provider(ref msg) if msg.contains("internal server error"))
         );
     }
 }

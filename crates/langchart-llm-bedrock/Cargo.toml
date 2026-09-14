@@ -34,6 +34,7 @@ aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 aws-smithy-types = "1"
 langchart-adapters.workspace = true
+futures.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
